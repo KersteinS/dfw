@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 KersteinS
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+import argparse
+import ipaddress
+import os
+import shutil
+import sys
+
+PROGRAM_NAME="dfw"
+VERSION="0.0.1"
+TRACE=5
+DEBUG=10
+INFO=20
+WARNING=30
+ERROR=40
+CRITICAL=50
+CONFIG_PATH="./etc/dfw/dfw.conf"
+UFW_RULES_PATH="./etc/ufw/after.rules"
+START_COMMENT=f"# START {PROGRAM_NAME} CHANGES.\n"
+END_COMMENT=f"# END {PROGRAM_NAME} CHANGES.\n"
+NOT_ROOT=1
+FILE_MISSING=2
+MISSING_MALFORMED_EDITS=3
+MISSING_MALFORMED_BLOCK=4
+CONFIG_EMPTY=5
+CONFIG_INVALID=6
+
+# -A DOCKER-USER -m conntrack --ctorigdstport 8080 -p tcp -j DROP
+# To flush all DOCKER-USER chain rules: sudo iptables -F DOCKER-USER
+# To list all DOCKER-USER chain rules: sudo iptables -L DOCKER-USER -n -v
+# Goals: Script that accepts ufw-like syntax to add rules to ufw's after.rules file. This allows rules to load before docker's rules in iptables, (but still after docker's NAT changes the dest port to the container port but I work aroudn that)  effectively enabling firewall for docker using the host ports rather than the destination port (which is the other popular solution). Script should accept as many ufw-like commands as possible and support similar options when possible.
+# Commands to support:
+# enable                          enables the firewall
+# disable                         disables the firewall
+# default ARG                     set default policy
+# logging LEVEL                   set logging to LEVEL
+# allow ARGS                      add allow rule
+# deny ARGS                       add deny rule
+# reject ARGS                     add reject rule
+# limit ARGS                      add limit rule
+# delete RULE|NUM                 delete RULE
+# insert NUM RULE                 insert RULE at NUM
+# prepend RULE                    prepend RULE
+# route RULE                      add route RULE
+# route delete RULE|NUM           delete route RULE
+# route insert NUM RULE           insert route RULE at NUM
+# reload                          reload firewall
+# reset                           reset firewall
+# status                          show firewall status
+# status numbered                 show firewall status as numbered list of RULES
+# status verbose                  show verbose firewall status
+# show ARG                        show firewall report
+# version                         display version information
+
+
+class Rule:
+    def __init__(*args, **kwargs):
+        log(args, kwargs, level=DEBUG)
+
+def get_version_string() -> str:
+    return f"{PROGRAM_NAME} version {VERSION}"
+
+def log(*args, level=INFO):
+    if level >= LOG_LEVEL:
+        print(*args)
+
+def write_config(config: str): # I can think of no case where I need to check for this failing. It should always succeed. PermissionError? I already check euid at start...
+    with open(CONFIG_PATH, "w") as conf:
+        conf.write(config)
+
+def read_config() -> str:
+    try:
+        with open(CONFIG_PATH, "r") as conf:
+            return conf.read()
+    except FileNotFoundError:
+        log(f"config file does not exist at {CONFIG_PATH}. Making a new, blank config file.", level=INFO)
+        write_config("")
+        return ""
+
+def is_valid(config: str) -> bool:
+    # TODO
+    # store states at the top of the config as comments. Like log enabled state and level.
+    # LOG: True|False
+    # LOG_LEVEL: off|low|medium|high|full
+    return True
+
+def read_rules_file() -> (list[str], int):
+    try:
+        with open(UFW_RULES_PATH, "r") as rules_file:
+            rules_list = rules_file.readlines()
+        log("Read rules file successfully", level=TRACE)
+        return rules_list, 0
+    except FileNotFoundError:
+        log(f"Reading {UFW_RULES_PATH} failed due to missing file. Aborting!", level=CRITICAL)
+        return [], FILE_MISSING
+
+def write_rules_file(content: list[str]) -> int:
+    try:
+        shutil.copy2(UFW_RULES_PATH, UFW_RULES_PATH+".bak")
+        log("Made backup of after.rules.", level=INFO)
+        if not os.path.exists(UFW_RULES_PATH+".original"):
+                shutil.copy2(UFW_RULES_PATH, UFW_RULES_PATH+".original")
+                log("Made backup of original after.rules", INFO)
+                return 0
+    except FileNotFoundError:
+        log(f"Couldn't back up {UFW_RULES_PATH} due to missing file. Aborting!", level=CRITICAL)
+        return FILE_MISSING
+    try:
+        with open(UFW_RULES_PATH, "w") as rules_file:
+            rules_file.writelines(content)
+        log("Wrote to after.rules.", level=TRACE)
+    except FileNotFoundError:
+        log(f"Couldn't write {UFW_RULES_PATH} due to missing file. Aborting!", level=CRITICAL)
+        return FILE_MISSING
+
+def get_start_end_indices(rules_list) -> (int, int):
+    try:
+        s_index = rules_list.index(START_COMMENT)
+        e_index = rules_list.index(END_COMMENT)
+        return s_index, e_index
+    except ValueError:
+        log(f"Couldn't locate a complete {PROGRAM_NAME} config block in after.rules. The file may not have any changes made by {PROGRAM_NAME} or it may be malformed.", level=WARNING)
+        return -1, -1
+
+def add_config_to_rules(config: str, is_dry: bool) -> int: # C - Create
+    if config == "":
+        log("config is empty. Nothing to write", level=WARNING)
+        return CONFIG_PATH
+    if not is_valid(config):
+        log("config has invalid syntax. Will not write.", level=WARNING)
+        return CONFIG_INVALID
+    rules_list, check = read_rules_file()
+    if check != 0:
+        return check
+    commit_index = -1
+    in_filter_block = False
+    for i, line in enumerate(rules_list):
+        stripped = line.strip()
+        if stripped.startswith("*filter"):
+            in_filter_block = True
+        if in_filter_block and stripped == "COMMIT":
+            commit_index = i
+            break
+    log(f"{commit_index=}", level=TRACE)
+    if commit_index == -1:
+        log(f"Couldn't locate a complete *filter block in {UFW_RULES_PATH}. Please ensure the file is set up correctly (incluing the COMMIT directive).", level=CRITICAL)
+        return MISSING_MALFORMED_BLOCK
+    target_index = -1
+    for i, line in enumerate(reversed(rules_list[:commit_index])):
+        stripped = line.strip()
+        if stripped.startswith("*filter"):
+            break # no longer in filter block. There is not blank line in between *filter and COMMIT, which is fine but needs to be accounted for.
+        if stripped == "":
+            target_index = commit_index - i
+            break
+    log(f"{target_index=}", level=TRACE)
+    if target_index == -1:
+        target_index = commit_index
+        log("Didn't find a blank line above the COMMIT line within the *filter block.", level=TRACE)
+    config = START_COMMENT + config + END_COMMENT
+    rules_list[target_index:target_index] = config
+    if not is_dry:
+        return write_rules_file(rules_list)
+    return 0
+
+def read_config_from_rules() -> (str, int): # R - Read
+    rules_list, check = read_rules_file()
+    if check != 0:
+        return "", check
+    start_index, end_index = get_start_end_indices(rules_list)
+    if start_index + end_index == -2:
+        return  "", MISSING_MALFORMED_EDITS
+    return "".join(rules_list[start_index:end_index+1]), 0
+
+def update_config_in_rules(config: str, is_dry: bool) -> int: # U - Update
+    # INFORMATION: This is not a true update. It erases the contents of added rules section and writes new contents. So if the user makes manual changes to the added rules section then uses a func which utilizes this update function, those manual changes will be lost. I don't know how else to do it without a bunch of looping and best-guessing.
+    if config == "":
+        log("config is empty. Nothing to write", level=WARNING)
+        return CONFIG_EMPTY
+    if not is_valid(config):
+        log("config has invalid syntax. Will not write.", level=ERROR)
+        return CONFIG_INVALID
+    if start_index + end_index == -2:
+        return MISSING_MALFORMED_EDITS
+    rules_list, check = read_rules_file()
+    if check != 0:
+        return check
+    start_index, end_index = get_start_end_indices(rules_list)
+    if start_index + end_index == -2:
+        return MISSING_MALFORMED_EDITS
+    rules_list = rules_list[:start_index] + rules_list[end_index+1:]
+    rules_list[start_index:start_index] = config
+    if not is_dry:
+        return write_rules_file(rules_list)
+    return 0
+
+def remove_config_from_rules(is_dry: bool) -> int: # D - Delete
+    rules_list, check = read_rules_file()
+    if check != 0:
+        return check
+    start_index, end_index = get_start_end_indices(rules_list)
+    if start_index + end_index == -2:
+        return MISSING_MALFORMED_EDITS
+    rules_list = rules_list[:start_index] + rules_list[end_index+1:]
+    if not is_dry:
+        return write_rules_file(rules_list)
+    return 0
+
+def status_is_enabled() -> (bool, int):
+    rules_list, check = read_rules_file()
+    if check != 0:
+        return False, check
+    start_index, end_index = get_start_end_indices(rules_list)
+    if start_index + end_index == -2:
+        return False, 0
+    else:
+        return True, 0
+
+def enable_func(args: argparse.Namespace) -> int:
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log(f"{args.config=}", level=INFO)
+    return add_config_to_rules(args.config, args.dry_run)
+
+def disable_func(args: argparse.Namespace) -> int:
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    return remove_config_from_rules(args.dry_run)
+
+def default_func(args: argparse.Namespace) -> int:
+    # default allow|deny|reject DIRECTION
+    #        change the default policy for traffic going DIRECTION, where DIRECTION is one of incoming, outgoing or routed. Note
+    #        that existing rules will have to be migrated manually when changing the default policy. See RULE SYNTAX for more on
+    #        deny and reject.
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def logging_func(args: argparse.Namespace) -> int:
+    # logging on|off|LEVEL
+    #        toggle  logging.  Logged  packets use the LOG_KERN syslog facility. Systems configured for rsyslog support may also
+    #        log to /var/log/ufw.log. Specifying a LEVEL turns logging on for the specified LEVEL.  The  default  log  level  is
+    #        'low'.  See LOGGING for details.
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def allow_func(args: argparse.Namespace) -> int:
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def deny_func(args: argparse.Namespace) -> int:
+    # Example of blocking port 8080
+    # :DOCKER-USER - [0:0]
+    # -A DOCKER-USER -m conntrack --ctorigdstport 8080 -p tcp -j DROP
+    # -A DOCKER-USER -m conntrack --ctorigdstport 8080 -p udp -j DROP
+    # -A DOCKER-USER -j RETURN
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def reject_func(args: argparse.Namespace) -> int:
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def limit_func(args: argparse.Namespace) -> int:
+    # Example of limit
+    # :DOCKER-USER - [0:0]
+    # -A DOCKER-USER -p tcp -m conntrack --ctorigdstport 8080 --ctstate NEW -m recent --set --name PORT8080
+    # -A DOCKER-USER -p tcp -m conntrack --ctorigdstport 8080 --ctstate NEW -m recent --update --seconds 30 --hitcount 6 --name PORT8080 -j DROP
+    # -A DOCKER-USER -j RETURN
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def delete_func(args: argparse.Namespace) -> int:
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def insert_func(args: argparse.Namespace) -> int:
+    # insert NUM RULE
+    #        insert the corresponding RULE as rule number NUM
+
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def prepend_func(args: argparse.Namespace) -> int:
+    # prepend RULE
+    #        prepend the corresponding RULE to the top of the ruleset
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def route_func(args: argparse.Namespace) -> int:
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def route_delete_func(args: argparse.Namespace) -> int:
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def route_insert_func(args: argparse.Namespace) -> int:
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def route_prepend_func(args: argparse.Namespace) -> int:
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def reload_func(args: argparse.Namespace) -> int:
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def reset_func(args: argparse.Namespace) -> int:
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def status_func(args: argparse.Namespace) -> int:
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def status_numbered_func(args: argparse.Namespace) -> int:
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def status_verbose_func(args: argparse.Namespace) -> int:
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def show_func(args: argparse.Namespace) -> int:
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    log("This operation is not yet implemented", level=WARNING)
+    return 0
+
+def version_func(args: argparse.Namespace) -> int:
+    log(f"{args=}", level=DEBUG)
+    log(f"{args.dry_run=}", level=INFO)
+    print(get_version_string()) # print here because it should always show regardless of log level.
+    return 0
+
+def configure_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=PROGRAM_NAME, description="CLI tool accepting ufw-like commands to modify ufw's after.rules file to support adding firewall rules that docker will respect.")
+    parser.add_argument("-d", "--dry-run", action="store_true", help="Run using given input without making any change to the system. This also attempts to test the provided command for validity.")
+    parser.add_argument("-v", "--verbose", action="count", default=0, help="Enable verbose logging (repeat up to 3x for increased verbosity).")
+    parser.add_argument("-s", "--suppress", action="count", default=0, help="Suppress error messages (repeat up to 2x to suppress all messages")
+    parser.add_argument("-V", "--version", action="version", version=get_version_string())
+
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Provide the command to run")
+
+    enable_parser = subparsers.add_parser("enable", help="Adds previously defined rules to ufw's after.rules file.")
+    enable_parser.set_defaults(func=enable_func)
+
+    disable_parser = subparsers.add_parser("disable", help=f"Removes all rules added by {PROGRAM_NAME} from ufw's after.rules file.")
+    disable_parser.set_defaults(func=disable_func)
+
+    default_parser = subparsers.add_parser("default", help="")
+    default_parser.set_defaults(func=default_func)
+
+    logging_parser = subparsers.add_parser("logging", help="") # may be redundant with --verbose?
+    logging_parser.set_defaults(func=logging_func)
+
+    allow_parser = subparsers.add_parser("allow", help=f"Adds an allow rule to ufw's after.rules file.")
+    allow_parser.set_defaults(func=default_func)
+
+    deny_parser = subparsers.add_parser("deny", help="Adds a deny rule to ufw's after.rules file.")
+    deny_parser.set_defaults(func=deny_func)
+
+    reject_parser = subparsers.add_parser("reject", help="Adds a reject rule to ufw's after.rules file.")
+    reject_parser.set_defaults(func=reject_func)
+
+    limit_parser = subparsers.add_parser("limit", help="Adds a limit rule to ufw's after.rules file.")
+    limit_parser.set_defaults(func=limit_func)
+
+    delete_parser = subparsers.add_parser("delete", help="Deletes the specified rule from ufw's after.rules file.")
+    delete_parser.set_defaults(func=delete_func)
+
+    insert_parser = subparsers.add_parser("insert", help="")
+    insert_parser.set_defaults(func=insert_func)
+
+    prepend_parser = subparsers.add_parser("prepend", help="")
+    prepend_parser.set_defaults(func=prepend_func)
+
+    route_parser = subparsers.add_parser("route", help=f"Adds a route rule to ufw's after.rules file. Use {PROGRAM_NAME} route --help for more options.")
+    route_parser.set_defaults(func=route_func)
+    route_parser_subparsers = route_parser.add_subparsers(dest="", required=False)
+    route_delete_parser = route_parser_subparsers.add_parser("delete", help="Deletes a route rule from ufw's after.rules file.")
+    route_delete_parser.set_defaults(func=route_delete_func)
+    route_insert_parser = route_parser_subparsers.add_parser("insert", help="")
+    route_insert_parser.set_defaults(func=route_insert_func)
+    route_prepend_parser = route_parser_subparsers.add_parser("prepend", help="")
+    route_prepend_parser.set_defaults(func=route_prepend_func)
+
+    reload_parser = subparsers.add_parser("reload", help=f"Removes and re-adds all {PROGRAM_NAME}-added rules from/to ufw's after.rules file, then reloads ufw.")
+    reload_parser.set_defaults(func=reload_func)
+
+    reset_parser = subparsers.add_parser("reset", help="")
+    reset_parser.set_defaults(func=reset_func)
+
+    status_parser = subparsers.add_parser("status", help=f"Prints all {PROGRAM_NAME}-added rules. Use {PROGRAM_NAME} status --help for more options.")
+    status_parser.set_defaults(func=status_func)
+    status_parser_subparsers = status_parser.add_subparsers(dest="", required=False)
+    status_numbered_parser = status_parser_subparsers.add_parser("numbered", help=f"Prints all {PROGRAM_NAME}-added rules as a numbered list.")
+    status_numbered_parser.set_defaults(func=status_numbered_func)
+    status_verbose_parser = status_parser_subparsers.add_parser("verbose", help=f"Prints all {PROGRAM_NAME}-added rules with additional details.")
+    status_verbose_parser.set_defaults(func=status_verbose_func)
+
+    show_parser = subparsers.add_parser("show", help="")
+    show_parser.set_defaults(func=show_func)
+
+    version_parser = subparsers.add_parser("version", help=f"Print {PROGRAM_NAME} version info.")
+    version_parser.set_defaults(func=version_func)
+
+    return parser
+
+def main():
+#    if os.geteuid() != 0:
+#        print(f"You need to be root to run this script")
+#        sys.exit(NOT_ROOT)
+    parser = configure_parser()
+    args = parser.parse_args()
+    global LOG_LEVEL
+    if args.verbose >= 3:
+        LOG_LEVEL = TRACE
+    elif args.verbose == 2:
+        LOG_LEVEL = DEBUG
+    elif args.verbose == 1:
+        LOG_LEVEL = INFO
+    elif args.suppress == 1:
+        LOG_LEVEL = ERROR
+    elif args.suppress >= 2:
+        LOG_LEVEL = CRITICAL
+    else:
+        LOG_LEVEL = WARNING
+    log(*sys.argv, level=DEBUG)
+    if not os.path.exists(UFW_RULES_PATH):
+        log(f"{UFW_RULES_PATH} doesn't exist, cannot remove config from rules. Aborting!", level=CRITICAL)
+        sys.exit(FILE_MISSING)
+    args.config = read_config()
+    sys.exit(args.func(args))
+
+if __name__ == "__main__":
+    main()
