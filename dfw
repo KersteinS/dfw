@@ -15,32 +15,60 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import argparse
+import base64
+import binascii
+from collections import deque
 import ipaddress
 import os
+import re
 import shutil
+import socket
+import string
 import subprocess
 import sys
+from typing import Self
 
+# Enum Metadata
 PROGRAM_NAME="dfw"
-VERSION="0.0.2"
+VERSION="0.0.3"
+
+# Enum Logging
 TRACE=5
 DEBUG=10
 INFO=20
 WARNING=30
 ERROR=40
 CRITICAL=50
-# CONFIG_PATH="./etc/dfw/dfw.conf"
+
+ALPHANUMERIC=string.ascii_lowercase + string.ascii_uppercase + string.digits
+
+# Enum Paths
+CONFIG_PATH="./etc/dfw/dfw.conf"
 DFW_RULES_PATH="./etc/dfw/dfw.rules"
-# START_COMMENT=f"# START {PROGRAM_NAME} CHANGES.\n"
-# END_COMMENT=f"# END {PROGRAM_NAME} CHANGES.\n"
+
+# Enum CommandArgs
+CHAIN="DOCKER-USER"
 RULE_COMMENT=f"{PROGRAM_NAME} ADDED RULE"
+
+# Enum Errors
 NOT_ROOT=1
 FILE_MISSING=2
 MISSING_MALFORMED_EDITS=3
 MISSING_MALFORMED_BLOCK=4
 CONFIG_EMPTY=5
 CONFIG_INVALID=6
-IPTABLES_ERROR=7
+RULE_INVALID=7
+IPTABLES_ERROR=8
+CONFIRMATION_DENIED=9
+
+RULES_HEAD= (
+        "-A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN\n"
+        "-A DOCKER-USER -i docker0 -j RETURN\n"
+        "-A DOCKER-USER -s 172.17.0.0/12 -j RETURN\n"
+        )
+RULES_TAIL_DENY="-A DOCKER-USER -j DROP"
+RULES_TAIL_ALLOW="-A DOCKER-USER -j RETURN"
+DEFAULT_IFACE="eth0"
 
 # -A DOCKER-USER -m conntrack --ctorigdstport 8080 -p tcp -j DROP
 # To flush all DOCKER-USER chain rules: sudo iptables -F DOCKER-USER
@@ -60,7 +88,7 @@ IPTABLES_ERROR=7
 # prepend RULE                    prepend RULE
 # route RULE                      add route RULE # route is not supported since the only chain managed by dfw is DOCKER-USER. THere is no other traffic besides traffinc being routed to DOCKER-USER
 # route delete RULE|NUM           delete route RULE # route is not supported since the only chain managed by dfw is DOCKER-USER. THere is no other traffic besides traffinc being routed to DOCKER-USER
-# route insert NUM RULE           insert route RULE at NUM # route is not supported since the only chain managed by dfw is DOCKER-USER. THere is no other traffic besides traffinc being routed to DOCKER-USER
+# route insert NUM RULE           insert route RULE at NUM # route is not supported since the only chain managed by dfw is DOCKER-USER. THere is no other traffic besides traffic being routed to DOCKER-USER
 # reload                          reload firewall
 # reset                           reset firewall
 # status                          show firewall status
@@ -69,71 +97,903 @@ IPTABLES_ERROR=7
 # show ARG                        show firewall report
 # version                         display version information
 
+def to_base64(string: str) -> str:
+    if not string:
+        return ""
+    return base64.urlsafe_b64encode(string.encode("utf-8")).decode("utf-8")
+
+def from_base64(string: str) -> str:
+    if not string:
+        return ""
+    try:
+        return base64.urlsafe_b64decode(string.encode("utf-8")).decode("utf-8")
+    except binascii.Error:
+        log("Corrupted/Invalid encoded comment. Skipping", level=ERROR)
+        return ""
+
+def get_default_interface() -> str:
+    with open("/proc/net/route") as file:
+        for line in file.readlines():
+            check = line.strip().split()
+            if len(check) > 2 and check [1] == "00000000":
+                return check[0]
+
 class Rule:
-    # TODO All rules need DFW_COMMENT: sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT -m comment --comment "DFW ADDED RULE"
-    def __init__(self, *args, **kwargs):
-        log(args, kwargs, level=DEBUG)
-        self.rule_text = args[0]
-        self.command_text = args[1]
-    # note: any is a wildcard that represents all possible addresses (0.0.0.0/0 for IPv4 and ::/0 for IPv6)
-    # note: rules will be made for IPv4 and IPv6 unless an address (or range of addresses) is provided that matches only either IPv4 or IPv6.
+    # TODO All rules need DFW_COMMENT: sudo iptables -A INPUT -p tcp --dport 22 -j RETURN -m comment --comment "DFW ADDED RULE"
+    chain = ""
+    invert_source_addr = False
+    invert_dest_addr = False
+    conntrack_mod = False
+    limit_mod = False
+    recent_mod = False
+    conntrack_orig_dest_port = ""
+    conntrack_state = ""
+    limit_limit = ""
+    limit_limit_burst = ""
+    recent_set = False
+    recent_update = False
+    recent_seconds = ""
+    recent_hitcount = ""
+    recent_name = ""
+    jump_target = ""
+
+    # These are used for rule parsing in validate_and_normalize
+    comment = ""
+    modification = ""
+    insert_index = ""
+    delete_index = ""
+    action = ""
+    direction = ""
+    output_interface = ""
+    input_interface = ""
+    log = ""
+    dapp = ""
+    ipv_type = ""
+    source_addr = ""
+    dest_addr = ""
+    sapp = ""
+    sports = ""
+    dports = ""
+    protocol = ""
+
     # note: app entries use ini-syntax like:
     #    [SomeService]
     #    title=Some title
     #    description=Some description
     #    ports=12/udp|34|56,78:90/tcp
-    # members for simple syntax:
-    # verb = allow|deny|reject|limit (required)
-    # direction = in|out (optional, default in
-    # log =  log|log-all (optional, if not provided, no specific logging for this rule is enabled. Note that global logging rules are applied seperately)
-    # port_and_proto = [ PORT[/PROTOCOL] | APPNAME ] (port at least is required, proto is optional and if not provided will allow both tcp and udp. Alternatively, an app name can be provided. If ufw is installed, dfw will use ufw's app definitions, otherwise, it will fallback to a dfw app definitions file)
-    # comment = a string comment (optional, unused if not provided. Length is limited to 256 - len(RULE_COMMENT)-1 and will be prepended with RULE_COMMENT)
 
-    # members for advanced syntax:
-    # verb
-    # direction 
-    # interface = valid network interface on system (ls /sys/class/net/ must be defined after direction and prefix with "on" keyword)
-    # log
-    # protocol = tcp|udp (optional, will be create a rule for both tcp and udp if ommitted)
-    # from_address = ip address to [verb] (optional, must be prepended by "from" keyword if used)
-    # from_port (port provided with from_address, can be substituted with an app name)
-    # to_address = ip address to [verb] (optional, must be provided by "to" keyword if used)
-    # to_port (port provided with to_address, can be substited with the "app" keyword and an app name)
-    # app = app APPNAME (can be used instead of "port" keyword and a port)
-    # comment
+    def parse_rule_ipt(self, line=""):
+        # This takes an ipt command and parses it into a Rule instance
+        if line == "":
+            line = self.rule_text
+        cmd = deque(line.split())
+        junk = []
+        invert_next_addr = False
+        while cmd:
+            i = cmd.popleft()
+            log(f"{i=}", level=TRACE)
+            if i in ("-A", "-D", "-I"):
+                self.action = i
+                j = cmd.popleft()
+                if j == CHAIN:
+                    self.chain = j
+                else:
+                    log(f"invalid chain provided: {j}", level=WARNING)
+                    junk.append(j)
+                    break
+                if i == "-I":
+                    if cmd[0].isdigit():
+                        self.insert_index = cmd.popleft()
+                    else:
+                        self.insert_index = 1
+                    continue
+                if i == "-D":
+                    if cmd[0].isdigit():
+                        self.delete_index = cmd.popleft()
+                        break
+                    continue
+                continue # -A has no special handling
+            if i == CHAIN:
+                self.chain = i
+                continue
+            if i == "-i":
+                self.input_interface = cmd.popleft()
+                continue
+            if i == "-o":
+                self.output_interface = cmd.popleft()
+                continue
+            if i == "!":
+                invert_next_addr = True
+                continue
+            if i == "-s":
+                self.source_addr = cmd.popleft()
+                self.invert_source_addr = invert_next_addr
+                invert_next_addr = False
+                continue
+            if i == "-d":
+                self.dest_addr = cmd.popleft()
+                self.invert_dest_addr = invert_next_addr
+                invert_next_addr = False
+                continue
+            if i == "-p":
+                self.protocol = cmd.popleft()
+                continue
+            if i == "--sport":
+                self.sport = cmd.popleft()
+                continue
+            if i == "--dport":
+                self.dport = cmd.popleft()
+                continue
+            # Unsuppported: --tcp-flags, --syn, --icmp-type
+            if i == "-m":
+                j = cmd.popleft()
+                if j in ("conntrack", "limit", "recent", "multiport", "string", "iprange", "owner", "hashlimit"):
+                    if j == "conntrack":
+                        self.conntrack_mod = True
+                        continue
+                    if j == "limit":
+                        self.limit_mod = True
+                        continue
+                    if j == "recent":
+                        self.recent_mod = True
+                        continue
+                    log(f"module {j} not currently supported", level=WARNING)
+                    junk.append(j)
+                    continue
+                log(f"Unrecognized module name: {j}", level=WARNING)
+                continue
+            if i in ("--ctstate", "--ctproto", "--ctorigsrc", "--ctorigdst", "--ctreplsrc", "--ctrepldst", "--ctorigsrcport", "--ctorigdstport", "--ctreplsrcport", "--ctrepldstport", "--ctstatus", "--ctexpire", "--ctdir"):
+                if self.conntrack_mod is False:
+                    log("Cannot enable conntrack module option without \"-m conntrack\" in command", level=WARNING)
+                    junk.append(cmd.popleft())
+                    continue
+                if i == "--ctorigdstport":
+                    self.conntrack_orig_dest_port = cmd.popleft()
+                    continue
+                if i == "--ctstate":
+                    self.conntrack_state = cmd.popleft()
+                    continue
+                log(f"conntrack module flag not currently supported: {i}.", level=WARNING)
+                junk.append(cmd.popleft())
+                continue
+            if i in ("--limit", "--limit-burst"):
+                if self.limit_mod is False:
+                    log("Cannot enable limit module option without \"-m limit\" in command", level=WARNING)
+                    junk.append(cmd.popleft())
+                    continue
+                if i == "--limit":
+                    self.limit_limit = cmd.popleft()
+                    continue
+                if i == "--limit-burst":
+                    self.limit_limit_burst = cmd.popleft()
+                continue
+            if i in ("--set", "--rcheck", "--update", "--remove", "--seconds", "--hitcount", "--rttl","--reap", "--name", "--rsource", "--rdest", "--mask"):
+                if self.recent_mod is False:
+                    log("Cannot enable recent module option without \"-m recent\" in command", level=WARNING)
+                    junk.append(cmd.popleft())
+                    continue
+                if i == "--set":
+                    self.recent_set = True
+                    continue
+                if i == "--update":
+                    self.recent_update = True
+                    continue
+                if i == "--seconds":
+                    self.recent_seconds = cmd.popleft()
+                    continue
+                if i == "--hitcount":
+                    self.recent_hitcount = cmd.popleft()
+                    continue
+                if i == "--name":
+                    self.recent_name = cmd.popleft()
+                    continue
+                log(f"recent module flag not currently supported: {i}.", level=WARNING)
+                # junk.append(cmd.popleft())
+                continue
+            if i == "-j":
+                self.jump_target = cmd.popleft()
+                continue
+            junk.append(i)
+        log(f"{junk=}", level=TRACE)
+        if len(junk) != 0:
+            log("Invalid iptables command!", level=ERROR)
+        return
 
-    @classmethod
-    def read(cls, line: str):
-        # This takes an iptre script line and parses it into a Rule instance
-        return cls(line, "")
+    @staticmethod
+    def check_ports(ports_str):
+        ports = ports_str.split(",")
+        if len(ports) + ports_str.count(":") > 15:
+            log(f"{len(ports)=}, {ports_str.count(':')=}", level=TRACE)
+            raise ValueError(f"Bad port \"{ports_str}\"")
+        for i in ports:
+            if not i:
+                log(f"{ports=}", level=TRACE)
+                raise ValueError(f"Bad port \"{ports_str}\"")
+            if ":" in i:
+                check = [j for j in i.split(":") if len(j) > 0 and 0 < int(j) < 65536]
+                if len(check) != 2 or  int(check[0]) > int(check[1]):
+                    log(f"{check=}", level=TRACE)
+                    raise ValueError(f"Bad port \"{ports_str}\"")
+                for j in range(int(check[0])+1, int(check[1])):
+                    check.insert(-1, str(j))
+            elif not 0 < int(i) < 65536:
+                log(f"{i=}", level=TRACE)
+                raise ValueError(f"Bad port \"{ports_str}\"")
+
+    @staticmethod
+    def is_valid_ipv4(address: str):
+        try:
+            ipaddress.IPv4Address(address)
+            return True
+        except (ipaddress.AddressValueError, ValueError):
+            log(f"{address} is not a vlid IPv4 address. Checking if it's a valid IPv4 network", level=TRACE)
+            # pass
+        try:
+            ipaddress.IPv4Network(address, strict=False)
+            return True
+        except (ipaddress.AddressValueError, ipaddress.NetmaskValueError, ValueError):
+            return False
     
+    @staticmethod
+    def is_valid_ipv6(address: str):
+        try:
+            ipaddress.IPv6Address(address)
+            return True
+        except (ipaddress.AddressValueError, ValueError):
+            log(f"{address} is not a vlid IPv6 address. Checking if it's a valid IPv6 network", level=TRACE)
+            # pass
+        try:
+            ipaddress.IPv6Network(address, strict=False)
+            return True
+        except (ipaddress.AddressValueError, ipaddress.NetmaskValueError, ValueError):
+            return False
+
+    @staticmethod
+    def determine_service_port(service_name) -> str:
+        try:
+            return str(socket.getservbyname(service_name))
+        except OSError:
+            log(f"{service_name=} does not have a matching entry in /etc/services", level=TRACE)
+            return ""
+
+    @staticmethod
+    def determine_service_proto(service_name) -> str:
+        proto = ""
+        try:
+            socket.getservbyname(service_name)
+        except OSError:
+            log(f"{service_name=} does not have a matching entry in /etc/services", level=TRACE)
+            return ""
+        try:
+            socket.getservbyname(service_name, "tcp")
+            proto = "tcp"
+        except OSError:
+            log(f"{service_name=} does not have a matching tcp entry in /etc/services", level=TRACE)
+            # pass
+        try:
+            socket.getservbyname(service_name, "udp")
+            if proto:
+                proto = "both"
+            else:
+                proto = "udp"
+        except OSError:
+            log(f"{service_name=} does not have a matching udp entry in /etc/services", level=TRACE)
+            # pass
+        return proto
+
+    @staticmethod
+    def check_comment(comment: str):
+        if "'" in comment:
+            log(f"{comment=}", level=TRACE)
+            raise ValueError("Comment may not contain \"'\"")
+
+    @staticmethod
+    def check_insert_index(index: str):
+        if not index.isdigit() or int(index)==0:
+            raise ValueError(f"Cannot insert rule at position \"{index}\"")
+
+    @staticmethod
+    def check_action(action: str):
+        if not action.lower() in ("allow", "deny", "reject", "limit"):
+            log(f"{action=}", level=TRACE)
+            raise ValueError("Invalid Syntax")
+
+    @staticmethod
+    def check_interface(interface: str):
+        if "!" in interface:
+            log(f"{interface=}", level=TRACE)
+            raise ValueError("Bad interface name: reserved character: \"!\"")
+        elif ":" in interface:
+            log(f"{interface=}", level=TRACE)
+            raise ValueError("Bad interface name: can't use interface aliases")
+        elif interface in (".", ".."):
+            log(f"{interface=}", level=TRACE)
+            raise ValueError("Bad interface name: can't use \".\" or \"..\"")
+        elif len(interface) > 15:
+            log(f"{interface=}", level=TRACE)
+            raise ValueError("Bad interface name: interface name is too long")
+        elif not all(char in ALPHANUMERIC+"_-.+,=%@" for char in interface):
+            log(f"{interface=}", level=TRACE)
+            raise ValueError("Bad interface name")
+
+    @staticmethod
+    def is_numeric_port(port: str) -> bool:
+        return all(char in string.digits+":," for char in port) and port[-1].isdigit() and port[0].isdigit()
+
+    @staticmethod
+    def check_supported_proto(proto: str):
+        if proto not in ("tcp", "udp", "ipv6", "esp", "ah", "esp", "gre", "igmp", "vrrp"):
+            raise ValueError(f"Unsupported protocol \"{proto}\"")
+
+    @staticmethod
+    def check_valid_port_protocol(proto: str):
+        if proto not in ("tcp", "udp"):
+            raise ValueError(f"Invalid port with protocol {proto}")
+
+    @staticmethod
+    def determine_ipvtype(source: str, dest: str):
+            if source == dest:
+                return source
+            elif "both" not in (source, dest):
+                log(f"{source=}, {dest=}", level=TRACE)
+                raise ValueError("Mixed IP versions for from and to")
+            elif source != "both":
+                return source
+            else: # therefore dest != "both"
+                return dest
+
     @classmethod
-    def interpret(cls, command: str):
-        # This takes a dfw command (e.g. dfw allow 8080) and parses it into a Rule instance
-        return cls("", command)
+    def parse_rule_command(cls, raw_command: str) -> Self:
+        # This takes a dfw command (e.g. allow 8080) and parses it into a Rule instance
+        # allow in on eth0 from 192.168.1.0/24 to any port 80 proto tcp
+        # deny in on eth1 from 10.0.0.0/8 to any port 22 proto tcp
+        # reject in on docker0 from 172.17.0.0/16 to any port 8080 proto tcp
+        # limit in on eth0 from any to any port 22 proto tcp
+        # allow 22
+        # allow 80/tcp
+        # allow 53/udp
+        # allow 6000:6100/tcp
+        # reject in 23
+        # limit in 22/tcp
+        # allow out 53/udp
+        # deny out 25/tcp
+        new_rule = Rule()
+        is_advanced = False
+        user_proto = ""
+        user_dport = ""
+        user_sport = ""
+        to_service = ""
+        from_service = ""
+        cmd = raw_command.split()
+        if len(cmd) < 2:
+            log(f"{cmd=}, {len(cmd)=}", level=TRACE)
+            raise ValueError("Invalid Syntax")
+        if "comment" in cmd:
+            loc = cmd.index("comment")
+            if loc > len(cmd) - 2:
+                log(f"{cmd=}, {len(cmd)=}", level=TRACE)
+                raise ValueError("Option \"comment\" missing required argument")
+            comment = cmd[loc+1:]
+            if len(comment) < 2:
+                check = comment[0]
+            else:
+                check = ' '.join(comment)
+            cls.check_comment(check)
+            new_rule.comment = to_base64(check)
+            cmd = cmd[:loc] # discard "comment" and comment arg
+        if cmd[0].lower() == "rule":
+            cmd.pop(0)
+        if len(cmd) < 2 or len(cmd) > 15:
+            log(f"{cmd=}, {len(cmd)=}", level=TRACE)
+            raise ValueError("Invalid Syntax")
+        if cmd[0].lower() in ("prepend", "insert", "delete"):
+            new_rule.modification = cmd.pop(0).lower()
+        if new_rule.modification == "insert":
+            if len(cmd) < 3:
+                log(f"{cmd=}, {len(cmd)=}", level=TRACE)
+                raise ValueError("Invalid Syntax")
+            check = cmd.pop(0)
+            cls.check_insert_index(check)
+            new_rule.insert_index = check
+        elif new_rule.modification == "delete":
+            if len(cmd) == 1 and cmd[0].isdigit():
+                new_rule.delete_index = cmd.pop(0)
+                return new_rule
+        if len(cmd) < 2:
+            log(f"{cmd=}, {len(cmd)=}", level=TRACE)
+            raise ValueError("Invalid Syntax")
+        check = cmd.pop(0)
+        cls.check_action(check)
+        new_rule.action = check
+        if len(cmd) < 1:
+            log(f"{cmd=}, {len(cmd)=}", level=TRACE)
+            raise ValueError("Invalid Syntax")
+        if ("in" in cmd or "out" in cmd) and cmd[0].lower() not in ("in", "out"):
+            raise ValueError("Invalid interface clause")
+        elif "in" not in cmd and "out" not in cmd:
+            new_rule.direction = "in"
+        else:
+            new_rule.direction = cmd.pop(0).lower()
+            if len(cmd) < 1 or "in" in cmd or "out" in cmd:
+                log(f"{cmd=}, {len(cmd)=}", level=TRACE)
+                raise ValueError("Invalid interface clause")
+            if cmd[0].lower() == "on":
+                is_advanced = bool(cmd.pop(0)) # set is_advanced to True
+                check = cmd.pop(0)
+                cls.check_interface(check)
+                if new_rule.direction == "out":
+                    new_rule.output_interface = check
+                else:
+                    new_rule.input_interface = check
+        # command could be done here. limit in on eth0
+        if len(cmd) > 0:
+            if cmd[0].lower() in ("log", "log-all") and len(cmd) > 1:
+                new_rule.log = cmd.pop(0).lower()
+            if "log" in cmd:
+                raise ValueError("option \"log\" not allowed here")
+            if "log-all" in cmd:
+                raise ValueError("option \"log-all\" not allowed here")
+        if len(cmd) == 1 and not is_advanced:
+            # simple syntax, assumes direction is "in" (unless specified otherwise) and ports are dest ports or to_service/dapp
+            if "/" in cmd[0]: # can't be an app if there's a /
+                check = cmd[0].split("/")
+                if len(check) != 2:# or not check[0] or not check[1]:
+                    log(f"{cmd=}, {len(check)=}", level=TRACE)
+                    raise ValueError("Bad port")
+                user_port = check[0]
+                user_proto = check[1]
+            else:
+                user_port = cmd[0]
+            if user_proto:
+                cls.check_supported_proto(user_proto)
+                cls.check_valid_port_protocol(user_proto)
+            if not user_port.isdigit() and user_port[0].isalnum() and all(char in ALPHANUMERIC+"_-.+" for char in user_port): # if True we're dealing with either a service or an application
+                if user_proto == "": # if user proto is "" it could be either a service or application still
+                    check = cls.determine_service_port(user_port)
+                    if check:
+                        to_service = user_port
+                    elif user_port in cls.get_applications(): 
+                        new_rule.dapp = user_port
+                    else:
+                        raise ValueError(f"Could not find a profile matching \"{user_port}\"")
+                else: # it must be a service
+                    check = cls.determine_service_port(user_port)
+                    if check:
+                        to_service = user_port
+                    else:
+                        log(f"{check=}, {len(check)=}", level=TRACE)
+                        raise ValueError("Bad port")
+            elif all(char in ALPHANUMERIC+",:" for char in user_port):
+                if not cls.is_numeric_port(user_port):
+                    log(f"{user_port=}", level=TRACE)
+                    raise ValueError("Port ranges must be numeric")
+                user_dport = user_port
+            else:
+                log(f"{user_port=}", level=TRACE)
+                raise ValueError("Bad port")
+            new_rule.ipv_type = "both"
+        elif len(cmd) % 2 != 0:
+            log(f"{cmd=}, {len(cmd)=}", level=TRACE)
+            raise ValueError("Wrong number of arguments")
+        elif "from" not in cmd and "to" not in cmd and not is_advanced:
+            raise ValueError("Need \"to\" or \"from\" clause")
+        else:
+            # full syntax required
+            # when using app in full syntax, ufw only refers to its applications.d configuration files 
+            # and will not fall back on /etc/services. And when using port in full syntax, it can be either 
+            # a port/port range or a service from /etc/services but not an app from applications.d.
+            is_advanced = True
+            valid_keys = ["proto", "from", "port", "app", "to"]
+            key_dict = {
+                    "proto": 0,
+                    "from": 0,
+                    "port": 0,
+                    "app": 0,
+                    "to": 0
+                    }
+            for i in cmd:
+                if i in key_dict.keys():
+                    key_dict[i] += 1
+            if key_dict["proto"] > 1 or key_dict["from"] > 1 or key_dict["port"] > 2 or key_dict["app"] > 2 or key_dict["to"] > 1 or (key_dict["app"] > 0 and key_dict["proto"] > 0):
+                log(f"{key_dict=}", level=TRACE)
+                raise ValueError("Improper rule syntax")
+            next_port_or_app = ""
+            source_ipv_type = "both"
+            dest_ipv_type = "both"
+            while len(cmd) > 1:
+                if cmd[0] not in valid_keys:
+                    raise ValueError(f"Invalid token \"{cmd[0]}\"")
+                elif cmd[0] == "proto":
+                    del cmd[0] # discard "proto"
+                    proto = cmd.pop(0) # retrieve proto value
+                    cls.check_supported_proto(proto)
+                    user_proto = proto
+                elif cmd[0] in ("from", "to"):
+                    direction = cmd.pop(0)
+                    addr = cmd.pop(0)
+                    ipv_type = ""
+                    if addr == "any":
+                        ipv_type = "both"
+                    else:
+                        if cls.is_valid_ipv4(addr):
+                            ipv_type = "4"
+                        elif cls.is_valid_ipv6(addr):
+                            ipv_type = "6"
+                        else:
+                            log(f"{addr=}", level=TRACE)
+                            raise ValueError("Bad source address")
+                        if direction == "from":
+                            new_rule.source_addr = addr
+                        else:
+                            new_rule.dest_addr = addr
+                    if direction == "from":
+                        source_ipv_type = ipv_type
+                    else:
+                        dest_ipv_type = ipv_type
+                    if len(cmd) > 1 and cmd[0] in ("port", "app"): # look ahead for port or app
+                        next_port_or_app = direction
+                elif cmd[0] == "port" or cmd[0] == "app":
+                    if next_port_or_app == "":
+                        raise ValueError(f"Need \"from\" or \"to\" with \"{cmd[0]}\"")
+                    key = cmd.pop(0)
+                    value = cmd.pop(0)
+                    if key == "app":
+                        app = value
+                        if next_port_or_app == "from":
+                            new_rule.sapp = app
+                        else:
+                            new_rule.dapp = app
+                        next_port_or_app = ""
+                    else:
+                        ports_str = value
+                        ports = ports_str.split(",")
+                        # value for port must be a service or port or port range. No / and protocol allowed.
+                        if not cls.is_numeric_port(ports_str):
+                            if "," in ports_str or ":" in ports_str:
+                                log(f"{ports_str=} and cannot contain colon or comma", level=TRACE)
+                                raise ValueError("Port ranges must be numeric")
+                            if next_port_or_app == "from":
+                                from_service = ports_str
+                            else:
+                                to_service = ports_str
+                        elif next_port_or_app == "from":
+                            user_sport = ports_str
+                        else:
+                            user_dport = ports_str
+                        next_port_or_app = ""
+            if user_proto and (user_dport != "" or user_sport != ""):
+                cls.check_valid_port_protocol(user_proto)
+            new_rule.ipv_type = cls.determine_ipvtype(source_ipv_type, dest_ipv_type)
+        from_service_proto = "both"
+        to_service_proto = "both"
+        if user_sport:
+            cls.check_ports(user_sport)
+            new_rule.sports = user_sport
+        elif from_service:
+            new_rule.sports = cls.determine_service_port(from_service)
+            if not new_rule.sports:
+                raise ValueError(f"Bad port \"{from_service}\"")
+            from_service_proto = cls.determine_service_proto(from_service)
+            if from_service_proto != "both":
+                cls.check_supported_proto(from_service_proto)
+        if user_dport:
+            try:
+                cls.check_ports(user_dport)
+                new_rule.dports = user_dport
+            except ValueError:
+                if not is_advanced:
+                    raise ValueError("Bad port")
+                else:
+                    raise
+        elif to_service:
+            new_rule.dports = cls.determine_service_port(to_service)
+            if not new_rule.dports and not is_advanced:
+                raise ValueError("Bad port")
+            elif not new_rule.dports:
+                raise ValueError(f"Bad port \"{to_service}\"")
+            to_service_proto = cls.determine_service_proto(to_service)
+            if to_service_proto != "both":
+                cls.check_supported_proto(to_service_proto)
+        if to_service or from_service:
+            if from_service_proto == to_service_proto:
+                new_rule.protocol = from_service_proto
+            elif "both" not in (from_service_proto, to_service_proto):
+                log(f"{from_service_proto=}, {to_service_proto=}", level=TRACE)
+                raise ValueError("Protocol mismatch (from/to)")
+            elif from_service_proto != "both":
+                new_rule.protocol = from_service_proto
+            else: # therefore to_service_proto != "both"
+                new_rule.protocol = to_service_proto
+            if new_rule.protocol != "both" and user_proto and new_rule.protocol != user_proto:
+                log(f"{new_rule.protocol=}, {user_proto=}", level=TRACE)
+                raise ValueError(f"Protocol mismatch with specified protocol {user_proto}")
+            elif new_rule.protocol == "both" and user_proto:
+                new_rule.protocol = user_proto
+        elif user_proto:
+            new_rule.protocol = user_proto
+        elif not is_advanced:
+            new_rule.protocol = "both"
+        else:
+            new_rule.protocol = "any"
+        if any(i in (":",",") for i in new_rule.sports+new_rule.dports):
+            # multiple ports detected. Must specify tcp or udp explicitly
+            if new_rule.protocol in ("any", "both"):
+                log(f"{new_rule.protocol=}", level=TRACE)
+                raise ValueError("Must specify \"tcp\" or \"udp\" with multiple ports")
+            elif new_rule.protocol not in ("tcp", "udp"):
+                log(f"{new_rule.protocol=}", level=TRACE)
+                raise ValueError("Bad port")
+        if new_rule.sapp or new_rule.dapp:
+            log(f"{new_rule.sapp=}, {new_rule.dapp=}", level=TRACE)
+            raise ValueError("Application Integration not currently supported") # TODO
+        return new_rule
 
-    def print_rule(self):
-        pass
+    def print_rule_form(self) -> str:
+        """Form pattern: action[_logtype] protocol ipv_type source_addr source_ports dest_addr dest_ports [sapp dapp] direction[_interface] [comment]"""
+        output = "[RULEFORM] "
+        logtype = f"_{self.log}" if self.log else ""
+        proto = "tcp/udp" if self.protocol == "both" else self.protocol
+        ipv_type = f"ipv{self.ipv_type}" if self.ipv_type != "both" else "both"
+        source_addr = self.source_addr if self.source_addr else "any"
+        dest_addr = self.dest_addr if self.dest_addr else "any"
+        sports = self.sports if self.sports else "any"
+        dports = self.dports if self.dports else "any"
+        sapp = ""
+        dapp = ""
+        if self.sapp or self.dapp:
+            sapp = self.sapp.replace(" ", "%20") + " " if self.sapp else "- "
+            dapp = self.dapp.replace(" ", "%20") + " " if self.dapp else "- "
+        if self.direction == "out":
+            direction_interface = f"out_{self.output_interface}" if self.output_interface else "out"
+        else:
+            direction_interface = f"in_{self.input_interface}" if self.input_interface else "in"
+        comment = f"comment={self.comment}" if self.comment else ""
+        output+=f"{self.action}{logtype} {proto} {ipv_type} {source_addr} {sports} {dest_addr} {dports} {sapp}{dapp}{direction_interface} {comment}"
+        return output
 
-    def push(self) -> int:
+    @classmethod
+    def parse_rule_form(cls, form: str):
+        """Form pattern: action[_logtype] protocol ipv_type source_addr source_ports dest_addr dest_ports [sapp dapp] direction[_interface] [comment]"""
+        errormsg = f"Invalid RULEFORM: {form}"
+        new_rule = Rule("", "")
+        parts = form.split()[1:] # immediately discard "[RULEFORM]"
+        if not 7 < len(parts) < 12:
+            log(f"{parts=}, {len(parts)=}", level=TRACE)
+            raise ValueError(errormsg)
+        if "comment=" in parts[-1]:
+            new_rule.comment = parts.pop(-1).replace("comments=", "")
+        if "_" in parts[0]:
+            action,logtype = parts.pop(0).split("_")
+        else:
+            action,logtype = parts.pop(0),""
+        try: 
+            cls.check_action(action)
+            new_rule.action = action
+        except ValueError:
+            log(f"{action=}", level=TRACE)
+            raise ValueError(errormsg)
+        if logtype not in ("", "log", "log-all"):
+            log(f"{logtype=}", level=TRACE)
+            raise ValueError(errormsg)
+        if logtype:
+            new_rule.log = logtype
+        proto = parts.pop(0)
+        if proto != "tcp/udp":
+            if proto != "any":
+                try:
+                    cls.check_supported_proto(proto)
+                except ValueError:
+                    log(f"{proto=}", level=TRACE)
+                    raise ValueError(errormsg)
+            new_rule.protocol = proto
+        else:
+            new_rule.protocol = "both"
+        ipv_type = parts.pop(0)
+        if ipv_type not in ("both", "ipv4", "ipv6"):
+            log(f"{ipv_type=}", level=TRACE)
+            raise ValueError(errormsg)
+        new_rule.ipv_type = ipv_type.replace("ipv", "")
+        source_addr = parts.pop(0)
+        if not (source_addr == "any" or cls.is_valid_ipv4(source_addr) or cls.is_valid_ipv6(source_addr)):
+            log(f"{source_addr=}", level=TRACE)
+            raise ValueError(errormsg)
+        if source_addr != "any":
+            new_rule.source_addr = source_addr
+        source_ports = parts.pop(0)
+        if source_ports != "any" and not cls.is_numeric_port(source_ports):
+            log(f"{source_ports=}", level=TRACE)
+            raise ValueError(errormsg)
+        if source_ports != "any":
+            new_rule.sports = source_ports
+        dest_addr = parts.pop(0)
+        if not (dest_addr == "any" or cls.is_valid_ipv4(dest_addr) or cls.is_valid_ipv6(dest_addr)):
+            log(f"{dest_addr=}", level=TRACE)
+            raise ValueError(errormsg)
+        if dest_addr != "any":
+            new_rule.dest_addr = dest_addr
+        dest_ports = parts.pop(0)
+        if dest_ports != "any" and not cls.is_numeric_port(dest_ports):
+            log(f"{dest_ports=}", level=TRACE)
+            raise ValueError(errormsg)
+        elif dest_ports != "any":
+            new_rule.dports = dest_ports
+        if new_rule.protocol not in ("any","both") and (new_rule.sports or new_rule.dports):
+            try:
+                new_rule.check_valid_port_protocol(new_rule.protocol)
+            except ValueError:
+                log(f"{new_rule.protocol=}", level=TRACE)
+                raise ValueError(errormsg)
+        if len(parts) == 3:
+            sapp = parts.pop(0)
+            if sapp != "-":
+                new_rule.sapp = sapp
+            dapp = parts.pop(0)
+            if dapp != "-":
+                new_rule.dapp = dapp
+        elif len(parts) == 1:
+            if "_" in parts[0]:
+                direction,interface = parts.pop(0).split("_")
+            else:
+                direction,interface = parts.pop(0),""
+            if direction not in ("in", "out"):
+                log(f"{direction=}", level=TRACE)
+                raise ValueError(errormsg)
+            new_rule.direction = direction
+            if interface:
+                try:
+                    cls.check_interface(interface)
+                except ValueError:
+                    log(f"{interface=}", level=TRACE)
+                    raise ValueError(errormsg)
+                if direction == "out":
+                    new_rule.output_interface = interface
+                else:
+                    new_rule.input_interface = interface
+        else:
+            raise ValueError(errormsg)
+        return new_rule
+
+    def print_rule_ipt(self, silent=False) -> str:
+        # print the rule as it is as an iptables rule or multiple rules as appropriate
+        # for cases where "on" isn't specified, in order for the rule to actually account for -i vs -o, I need to either make a rule using a sensible default or make multiple rules covering all ins and outs (harder of course).
+        # Rule context:
+        # -A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN # Allow containers to reach out
+        # -A DOCKER-USER -i docker0 -j RETURN # allow docker-internal comms part 1 (by interface)
+        # -A DOCKER-USER -s 172.17.0.0/12 -j RETURN # allow docker-internal comms part 2 (by subnet)
+        # append all other rules here
+        # -A DOCKER-USER -j DROP # drop all other conns # This is the default action line. So it can be RETURN or DROP (allow or deny)
+        # Form pattern: action[_logtype] protocol ipv_type source_addr source_ports dest_addr dest_ports [sapp dapp] direction[_interface] [comment]
+        # [RULEFORM] allow tcp both any any any 8080 in
+        # -A DOCKER-USER -i {default_iface} -m conntrack --ctorigdstport 8080 --ctdir ORIGINAL -p tcp -j RETURN
+        # [RULEFORM] allow any ipv4 162.237.248.148 any 192.168.1.50 8080 in
+        # -A DOCKER-USER -i {default_iface} -m conntrack --ctorigsrc 162.237.248.148 --ctorigdst 192.168.1.50 --ctorigdstport 8080 --ctdir ORIGINAL -p tcp -j RETURN
+        # -A DOCKER-USER -i {default_iface} -m conntrack --ctorigsrc 162.237.248.148 --ctorigdst 192.168.1.50 --ctorigdstport 8080 --ctdir ORIGINAL -p udp -j RETURN
+        rules = [f"-A {CHAIN} "]
+        if self.direction == "out":
+            rules[0] += "-o "
+            if self.output_interface:
+                rules[0] += f"{self.output_interface} "
+            else:
+                rules[0] += f"{DEFAULT_IFACE} "
+                if not silent:
+                    log(f"No output interface was provided (no \"on\" clause). Due to the implementation of the DOCKER-USER chain, the default interface to the internet ({DEFAULT_IFACE}) has been provisioned for this rule", level=WARNING)
+        else:
+            rules[0] += "-i "
+            if self.input_interface:
+                rules[0] += f"{self.input_interface} "
+            elif not silent:
+                log(f"No input interface was provided (no \"on\" clause). Due to the implementation of the DOCKER-USER chain, the default interface to the internet ({DEFAULT_IFACE}) has been provisioned for this rule", level=WARNING)
+                rules[0] += f"{DEFAULT_IFACE} "
+        rules[0] += "-m conntrack --ctdir ORIGINAL "
+        if self.source_addr and self.source_addr != "any":
+            rules[0] += f"--ctorigsrc {self.source_addr} "
+        if self.dest_addr and self.dest_addr != "any":
+            rules[0] += f"--ctorigdst {self.dest_addr} "
+        if self.sports:
+            if "," not in self.sports:
+                rules[0] += f"--ctorigsrcport {self.sports} "
+            else:
+                raise ValueError("ctorigsrcport does not support csv for port ranges, only ranges using colon (:)")
+        if self.dports:
+            if "," not in self.dports:
+                rules[0] += f"--ctorigdstport {self.dports} "
+            else:
+                raise ValueError("ctorigdstport does not support csv for port ranges, only ranges using colon (:)")
+        if self.protocol == "both":
+            rules.append(rules[0])
+            rules[0] += "-p tcp "
+            rules[1] += "-p udp "
+        else:
+            rules[0] += f"-p {self.protocol} "
+        if self.action == "allow":
+            action = "-j RETURN"
+        elif self.action == "deny":
+            action = "-j DROP"
+        elif self.action == "reject":
+            action = "-j REJECT"
+        elif self.action == "limit":
+            raise ValueError("limit action not implemented yet")
+        for i in range(len(rules)):
+            rules[i] += action
+        return '\n'.join(f"{i}" for i in rules)
+
+    def print_rule_dfw(self) -> str:
+        # print the rule as it was entered in ufw-like syntax
+        is_advanced = bool(self.input_interface or self.output_interface or self.source_addr or self.sports or self.dest_addr)
+        action = self.action
+        direction = self.direction
+        if is_advanced:
+            from_clause = ""
+            to_clause = ""
+            interface = self.input_interface if self.input_interface else self.output_interface
+            if self.source_addr or self.sports:
+                from_clause = f" from {self.source_addr if self.source_addr else 'any'}{' port '+self.sports if self.sports else ''}"
+                if self.sapp:
+                    from_clause += f" app {self.sapp}"
+            if self.dest_addr or self.dports:
+                to_clause = f" to {self.dest_addr if self.dest_addr else 'any'}{' port '+self.dports if self.dports else ''}"
+                if self.dapp:
+                    to_clause += f" app {self.dapp}"
+            return f"{self.action} {self.direction} {'on '+interface if interface else ''}{self.log+' ' if self.log else ''}{from_clause}{to_clause}{'proto '+{self.protocol} if self.protocol not in ('both', 'any', '') else ''}"
+        else:
+            port_proto = self.dports
+            if self.protocol in ("tcp", "udp"):
+                port_proto += f"/{self.protocol}"
+            return f"{self.action} {self.direction} {self.log+' ' if self.log else ''}{port_proto}"
+
+    @staticmethod
+    def get_applications() -> tuple[str]:
+        # TODO implement some basic file-level validation logic here
+        return (
+                "ssh",
+                "smtp",
+                "tftp",
+                "Socks",
+                "PeopleNearby",
+                "auth",
+                "badApp"
+                )
+
+    def get_port_proto_from_app(self, app: str) -> (str, str):
+        # TODO implement some validation logic here for the requested app
+        if app == "Socks":
+            return "100", "tcp"
+        elif app == "PeopleNearby":
+            return  "555", "udp"
+        elif app == "ssh":
+            return "22", "tcp"
+        elif app == "badApp":
+            return "101", "ipv6"
+        elif app == "smtp":
+            return "25", "tcp"
+        else:
+            return "000", "fake-proto"
+
+    def push(self, is_dry) -> int:
         # This makes sends the Rule to iptables.
         cmd = ["iptables"] # need to construct the command based on defined members created in interpret or read
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            return result.returncode
-        except subprocess.CalledProcessError as e:
-            log(f"Command failed: {' '.join(cmd)}\nError: {e.stderr}", CRITICAL)
-            return IPTABLES_ERROR
-            
+        cmd.extend(self.print_rule_ipt().split())
+        if not len(cmd) > 2:
+            return RULE_INVALID
+        if not is_dry:
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                return result.returncode
+            except subprocess.CalledProcessError as e:
+                log(f"Command failed: {' '.join(cmd)}\nError: {e.stderr}", CRITICAL)
+                return IPTABLES_ERROR
+        else:
+            log(f"iptables command would have been: {cmd}", level=INFO)
+            return 0
 
 def get_version_string() -> str:
     return f"{PROGRAM_NAME} version {VERSION}"
 
-def log(*args, level=INFO):
+def log(*args, level=INFO, **kwargs):
     if level >= LOG_LEVEL:
-        print(*args)
+        print(*args, **kwargs)
 
-def write_config(config: str): # I can think of no case where I need to check for this failing. It should always succeed. PermissionError? I already check euid at start...
+def write_config(config: str): # I can think of no case where I need to check for this failing. It should always succeed. PermissionError? I already check euid and verify/create the config at program startup...
     with open(CONFIG_PATH, "w") as conf:
         conf.write(config)
 
@@ -149,81 +1009,107 @@ def read_config() -> str:
 def is_config_valid(config: str) -> bool:
     # TODO
     # store states at the top of the config as comments. Like log enabled state and level.
+    # ENABLED: True|False
+    # DEFAULT: allow|deny
     # LOG: True|False
     # LOG_LEVEL: off|low|medium|high|full
     return True
 
 def read_rules_file() -> (list[str], int):
+    rules_list = []
     try:
         with open(DFW_RULES_PATH, "r") as rules_file:
-            rules_list = rules_file.readlines()
+            for line in rules_file.readlines():
+                if line.startswith("[RULEFORM]"):
+                    rules_list.append(line)
         log("Read rules file successfully", level=TRACE)
         return rules_list, 0
     except FileNotFoundError:
         log(f"Reading {DFW_RULES_PATH} failed due to missing file. Aborting!", level=CRITICAL)
         return [], FILE_MISSING
 
-def write_rules_file(content: list[str]) -> int:
+def write_rules_file(content: str, action: str) -> int:
+    # rules should only consist of [RULEFORM]s and the associated iptable rule(s) for each form. The initial few lines of dfw.rules never change (store these in code), and the final line is determined by the value of default in dfw.conf.
     try:
         shutil.copy2(DFW_RULES_PATH, DFW_RULES_PATH+".bak")
-        log("Made backup of dfw.rules.", level=INFO)
-        if not os.path.exists(DFW_RULES_PATH+".original"):
-                shutil.copy2(DFW_RULES_PATH, DFW_RULES_PATH+".original")
-                log("Made backup of original after.rules", INFO)
-                return 0
+        log("Made backup of dfw.rules.", level=DEBUG)
     except FileNotFoundError:
         log(f"Couldn't back up {DFW_RULES_PATH} due to missing file. Aborting!", level=CRITICAL)
         return FILE_MISSING
-    try:
-        with open(DFW_RULES_PATH, "w") as rules_file:
-            rules_file.writelines(content)
-        log("Wrote to after.rules.", level=TRACE)
-    except FileNotFoundError:
-        log(f"Couldn't write {DFW_RULES_PATH} due to missing file. Aborting!", level=CRITICAL)
-        return FILE_MISSING
+    with open(DFW_RULES_PATH, "w") as rules_file:
+        rules_file.writelines(content)
+    log("Wrote to dfw.rules.", level=DEBUG)
+    print(action)
 
-# Rules file should not be in a format compatible with iptables-restore, as we don't want to flush the *filter table when loading. I also want to avoid using iptables-restore --no-flush for consistency reasons. I will manually add/remove individual rules using iptables directly.
-def create_rules(is_dry: bool) -> int: # C - Create
-    # make the rules file with baseline rules
-    # -I DOCKER-USER 1 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN # Allow containers to reach out
-    # -I DOCKER-USER 2 -i docker0 -j RETURN # allow docker-internal comms part 1 (by interface)
-    # -I DOCKER-USER 3 -s 172.17.0.0/12 -j RETURN # allow docker-internal comms part 2 (by subnet)
-    # -I DOCKER-USER 4 -j DROP # drop all other conns
-    # Note that this means custom docker interfaces (which users can use) will also be blocked/dropped. Need to add a config around that. Maybe they can just explicitly allow it. There is potentially a way to use dynamic docker network discovery using docker network inspect command?
-    if not is_dry:
-        return write_rules_file([""])
+def request_confirmation(prompt: str) -> bool:
+    while True:
+        check = input(f"{prompt}\nProceed with operation (y|n)? ")
+        if check.lower() == "y":
+            return True
+        elif check.lower() == "n":
+            return False
 
-def read_rules() -> (list[Rule], int): # R - Read
-    # return a list of Rule instances. Rules read from rules file
-    rules_list, check = read_rules_file()
+def process_rule(new_rule: Rule, default="deny") -> (str,str,int):
+    rules_str_list,check = read_rules_file()
     if check != 0:
-        return "", check
-    return [Rule.read(i) for i in rules_list], 0
-
-def update_rules(command: str, is_dry: bool) -> int: # U - Update
-    # Add a rule to the rules file at the indicated index
-    current_rules, check = read_rules()
-    if check != 0:
-        return check
-    current_rules.append(Rule.interpret(command))
-    if not is_dry:
-        return write_rules_file(rules_list)
-    return 0
-
-def remove_rule_from_rules(is_dry: bool) -> int: # D - Delete
-    rules_list, check = read_rules_file()
-    if check != 0:
-        return check
-    start_index, end_index = get_start_end_indices(rules_list)
-    if start_index + end_index == -2:
-        return MISSING_MALFORMED_EDITS
-    rules_list = rules_list[:start_index] + rules_list[end_index+1:]
-    if not is_dry:
-        return write_rules_file(rules_list)
-    return 0
+        return "","",check
+    rules = []
+    for rule_str in rules_str_list:
+        try:
+            rule = Rule.parse_rule_form(rule_str)
+        except ValueError as e:
+            log(f"ERROR: {e} in {DFW_RULES_PATH}", level=ERROR)
+            return "","",RULE_INVALID
+        rules.append(rule)
+    if new_rule.modification == "delete":
+        if new_rule.delete_index:
+            index = int(new_rule.delete_index)
+            if len(rules) < 1 or len(rules) < index:
+                log("Invalid rule index", level=ERROR)
+                return "","",RULE_INVALID
+            if request_confirmation(f"Deleting:\n {rules[index-1].print_rule_dfw()}") == True:
+                del rules[index-1]
+            else:
+                return "","",CONFIRMATION_DENIED
+        else:
+            index = None
+            check_vs = new_rule.print_rule_form()
+            for i,rule in enumerate(rules):
+                if check_vs == rule.print_rule_form():
+                    index = i
+                    break
+            else:
+                log("No rule matched input", level=ERROR)
+                return "","",RULE_INVALID
+            if request_confirmation(f"Deleting:\n {rules[index].print_rule_dfw()}") == True:
+                del rules[index]
+            else:
+                return "","",CONFIRMATION_DENIED
+        summary = "Rule deleted"
+    elif new_rule.modification in ("insert","prepend"):
+        index = 0 if new_rule.modification == "prepend" else int(new_rule.insert_index)
+        rules.insert(index-1, new_rule)
+        summary = "Rule added"
+    else:
+        check_vs = new_rule.print_rule_form()
+        for i,rule in enumerate(rules):
+            if check_vs == rule.print_rule_form():
+                index = i
+                log("Skipping adding existing rule", level=WARNING)
+                return "","",RULE_INVALID
+        rules.append(new_rule)
+        summary = "Rule added"
+    content = (
+        f"# generated by {PROGRAM_NAME} version {VERSION}. Default={default}\n"
+        f"{RULES_HEAD}\n"
+        + '\n\n'.join(f"{rule.print_rule_form()}\n{rule.print_rule_ipt(True)}" for rule in rules)
+        + (f"\n\n{RULES_TAIL_DENY}\n" if default=="deny" else f"\n\n{RULES_TAIL_ALLOW}\n")
+    )
+    return content,summary,0
 
 def status_is_enabled() -> (bool, int):
     # This needs testing and refining. I want proper error handling if something is wrong in the command itself (using check=True) but I expect grep to return non-zero if dfw is disabled...
+    # shell=True is a security risk, technically speaking but since no part of the input relies on user-input it should be okay.
     try:
         result = subprocess.run(f"iptables -S | grep -- '{RULE_COMMENT}'", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         return result.returncode == 0
@@ -233,175 +1119,125 @@ def status_is_enabled() -> (bool, int):
 
 # I need to make sure that if docker restarts, this application detects that and re-applies the rules. docker restart flushes the DOCKER_USER chain, you see.
 def push_rules_to_iptables(is_dry) -> int:
-    # Gets the list of Rules, loops over them, checks if the rule is already added and adds it if not.
-    # Run this at the end of enable_func, allow_func, deny_func, etc. if not dry-run. If is_dry, run iptables-restore --test on the full rule set
-    # Must confirm rule doesn't exist already! This may be a challenge if iptables canonicalizes the rule differently than I store it in my rules file. Look at iptables -S
-    rules_list, check = read_rules()
-    if check != 0:
-        return check
-    # TODO
+    # TODO read rules from dfw.rules, flush chain, and apply rules from dfw.rules.
 
     return 0
 
-def remove_rule_from_iptables(rule: Rule) -> int:
-    # Receive a Rule instance, look for it in iptables, if present - remove it.
-    if Rule.rule_text
-    return 0
+def check_rule_form_parsing(rule: Rule):
+    ruleform = rule.print_rule_form()
+    log(rule.print_rule_form.__doc__, level=DEBUG)
+    log(ruleform, level=DEBUG)
+    rule_vars = vars(rule)
+    rerule_vars = vars(Rule.parse_rule_form(ruleform))
+    log(rerule_vars, level=DEBUG)
+    failures = ""
+    for key,val in rerule_vars.items():
+        if key in rule_vars.keys() and rule_vars[key] == val:
+            continue
+        failures += f"{key}: {val}\n"
+    if failures:
+        raise ValueError(f"Rule vs Rerule not a match:\n{failures[:-1]}")
 
-def enable_func(args: argparse.Namespace) -> int:
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
-    log(f"{args.config=}", level=INFO)
+def enable_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
+    log(f"{args=}", level=TRACE
+    log(f"{args.dry_run=}", level=DEBUG)
+    log(f"{args.config=}", level=DEBUG)
     if not args.dry_run:
         return push_rules_to_iptables()
     else:
         return 0
 
-def disable_func(args: argparse.Namespace) -> int:
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
+def disable_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
+    log(f"{args=}", level=TRACE
+    log(f"{args.dry_run=}", level=DEBUG)
+    log(f"{args.config=}", level=DEBUG)
     return remove_config_from_rules(args.dry_run)
 
-def default_func(args: argparse.Namespace) -> int:
+def default_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     # default allow|deny|reject DIRECTION
     #        change the default policy for traffic going DIRECTION, where DIRECTION is one of incoming, outgoing or routed. Note
     #        that existing rules will have to be migrated manually when changing the default policy. See RULE SYNTAX for more on
     #        deny and reject.
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
+    log(f"{args=}", level=TRACE
+    log(f"{args.dry_run=}", level=DEBUG)
     log("This operation is not yet implemented", level=WARNING)
     return 0
 
-def logging_func(args: argparse.Namespace) -> int:
+def logging_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     # logging on|off|LEVEL
     #        toggle  logging.  Logged  packets use the LOG_KERN syslog facility. Systems configured for rsyslog support may also
     #        log to /var/log/ufw.log. Specifying a LEVEL turns logging on for the specified LEVEL.  The  default  log  level  is
     #        'low'.  See LOGGING for details.
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
+    log(f"{args=}", level=TRACE
+    log(f"{args.dry_run=}", level=DEBUG)
     log("This operation is not yet implemented", level=WARNING)
     return 0
 
-def allow_func(args: argparse.Namespace) -> int:
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
-    log("This operation is not yet implemented", level=WARNING)
-    return 0
-
-def deny_func(args: argparse.Namespace) -> int:
+def rule_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     # Example of blocking port 8080
     # :DOCKER-USER - [0:0]
     # -A DOCKER-USER -m conntrack --ctorigdstport 8080 -p tcp -j DROP
     # -A DOCKER-USER -m conntrack --ctorigdstport 8080 -p udp -j DROP
     # -A DOCKER-USER -j RETURN
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
-    log("This operation is not yet implemented", level=WARNING)
-    return 0
-
-def reject_func(args: argparse.Namespace) -> int:
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
-    log("This operation is not yet implemented", level=WARNING)
-    return 0
-
-def limit_func(args: argparse.Namespace) -> int:
     # Example of limit
     # :DOCKER-USER - [0:0]
     # -A DOCKER-USER -p tcp -m conntrack --ctorigdstport 8080 --ctstate NEW -m recent --set --name PORT8080
     # -A DOCKER-USER -p tcp -m conntrack --ctorigdstport 8080 --ctstate NEW -m recent --update --seconds 30 --hitcount 6 --name PORT8080 -j DROP
     # -A DOCKER-USER -j RETURN
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
+    log(f"{args=}", level=TRACE)
+    log(f"command and remainder are: {args.command}, {' '.join(remainder)}", level=TRACE)
+    try:
+        rule = Rule.parse_rule_command(f"{args.command} {' '.join(remainder)}")
+    except ValueError as e:
+        log(f"ERROR: {e}", level=ERROR)
+        return 1
+    log(vars(rule), level=DEBUG)
+    if not rule.modification: # don't test on delete/insert/prepend rules
+        check_rule_form_parsing(rule)
+    if rule.action:
+        log(f"{rule.print_rule_ipt(True)=}", level=DEBUG)
+    # need to place the rule in the rule file then update the rules in iptables
+    new_rules,summary,check = process_rule(rule, "deny") # TODO implement config checking to see if we are doing deny or allow as default
+    if check != 0:
+        return check
+    if not args.dry_run:
+        return write_rules_file(new_rules,summary)
+    else:
+        print(new_rules)
+        return 0
+
+def reload_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
+    log(f"{args=}", level=TRACE
     log("This operation is not yet implemented", level=WARNING)
     return 0
 
-def delete_func(args: argparse.Namespace) -> int:
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
+def reset_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
+    log(f"{args=}", level=TRACE
     log("This operation is not yet implemented", level=WARNING)
     return 0
 
-def insert_func(args: argparse.Namespace) -> int:
-    # insert NUM RULE
-    #        insert the corresponding RULE as rule number NUM
-
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
+def status_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
+    log(f"{args=}", level=TRACE
     log("This operation is not yet implemented", level=WARNING)
     return 0
 
-def prepend_func(args: argparse.Namespace) -> int:
-    # prepend RULE
-    #        prepend the corresponding RULE to the top of the ruleset
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
+def status_numbered_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
+    log(f"{args=}", level=TRACE
     log("This operation is not yet implemented", level=WARNING)
     return 0
 
-def route_func(args: argparse.Namespace) -> int:
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
+def status_verbose_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
+    log(f"{args=}", level=TRACE
     log("This operation is not yet implemented", level=WARNING)
     return 0
 
-def route_delete_func(args: argparse.Namespace) -> int:
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
+def show_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
+    log(f"{args=}", level=TRACE
     log("This operation is not yet implemented", level=WARNING)
     return 0
 
-def route_insert_func(args: argparse.Namespace) -> int:
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
-    log("This operation is not yet implemented", level=WARNING)
-    return 0
-
-def route_prepend_func(args: argparse.Namespace) -> int:
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
-    log("This operation is not yet implemented", level=WARNING)
-    return 0
-
-def reload_func(args: argparse.Namespace) -> int:
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
-    log("This operation is not yet implemented", level=WARNING)
-    return 0
-
-def reset_func(args: argparse.Namespace) -> int:
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
-    log("This operation is not yet implemented", level=WARNING)
-    return 0
-
-def status_func(args: argparse.Namespace) -> int:
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
-    log("This operation is not yet implemented", level=WARNING)
-    return 0
-
-def status_numbered_func(args: argparse.Namespace) -> int:
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
-    log("This operation is not yet implemented", level=WARNING)
-    return 0
-
-def status_verbose_func(args: argparse.Namespace) -> int:
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
-    log("This operation is not yet implemented", level=WARNING)
-    return 0
-
-def show_func(args: argparse.Namespace) -> int:
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
-    log("This operation is not yet implemented", level=WARNING)
-    return 0
-
-def version_func(args: argparse.Namespace) -> int:
-    log(f"{args=}", level=DEBUG)
-    log(f"{args.dry_run=}", level=INFO)
+def version_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
+    log(f"{args=}", level=TRACE)
     print(get_version_string()) # print here because it should always show regardless of log level.
     return 0
 
@@ -426,36 +1262,29 @@ def configure_parser() -> argparse.ArgumentParser:
     logging_parser = subparsers.add_parser("logging", help="") # may be redundant with --verbose?
     logging_parser.set_defaults(func=logging_func)
 
+    rule_parser = subparsers.add_parser("rule", help=f"Add a rule {PROGRAM_NAME}.")
+    rule_parser.set_defaults(func=rule_func)
+
     allow_parser = subparsers.add_parser("allow", help=f"Adds an allow rule to ufw's after.rules file.")
-    allow_parser.set_defaults(func=default_func)
+    allow_parser.set_defaults(func=rule_func)
 
     deny_parser = subparsers.add_parser("deny", help="Adds a deny rule to ufw's after.rules file.")
-    deny_parser.set_defaults(func=deny_func)
+    deny_parser.set_defaults(func=rule_func)
 
     reject_parser = subparsers.add_parser("reject", help="Adds a reject rule to ufw's after.rules file.")
-    reject_parser.set_defaults(func=reject_func)
+    reject_parser.set_defaults(func=rule_func)
 
     limit_parser = subparsers.add_parser("limit", help="Adds a limit rule to ufw's after.rules file.")
-    limit_parser.set_defaults(func=limit_func)
+    limit_parser.set_defaults(func=rule_func)
 
     delete_parser = subparsers.add_parser("delete", help="Deletes the specified rule from ufw's after.rules file.")
-    delete_parser.set_defaults(func=delete_func)
+    delete_parser.set_defaults(func=rule_func)
 
     insert_parser = subparsers.add_parser("insert", help="")
-    insert_parser.set_defaults(func=insert_func)
+    insert_parser.set_defaults(func=rule_func)
 
     prepend_parser = subparsers.add_parser("prepend", help="")
-    prepend_parser.set_defaults(func=prepend_func)
-
-    route_parser = subparsers.add_parser("route", help=f"Adds a route rule to ufw's after.rules file. Use {PROGRAM_NAME} route --help for more options.")
-    route_parser.set_defaults(func=route_func)
-    route_parser_subparsers = route_parser.add_subparsers(dest="", required=False)
-    route_delete_parser = route_parser_subparsers.add_parser("delete", help="Deletes a route rule from ufw's after.rules file.")
-    route_delete_parser.set_defaults(func=route_delete_func)
-    route_insert_parser = route_parser_subparsers.add_parser("insert", help="")
-    route_insert_parser.set_defaults(func=route_insert_func)
-    route_prepend_parser = route_parser_subparsers.add_parser("prepend", help="")
-    route_prepend_parser.set_defaults(func=route_prepend_func)
+    prepend_parser.set_defaults(func=rule_func)
 
     reload_parser = subparsers.add_parser("reload", help=f"Removes and re-adds all {PROGRAM_NAME}-added rules from/to ufw's after.rules file, then reloads ufw.")
     reload_parser.set_defaults(func=reload_func)
@@ -479,14 +1308,16 @@ def configure_parser() -> argparse.ArgumentParser:
 
     return parser
 
-def main():
-#    if os.geteuid() != 0:
-#        print(f"You need to be root to run this script")
-#        sys.exit(NOT_ROOT)
+def docker_user_chain_exists():
+    try:
+        result = subprocess.run(["iptables", "-L", "DOCKER-USER", "-n"])
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
 
-    # TODO Must confirm DOCKER-USER table is present: if sudo iptables -L DOCKER-USER -n -v &>/dev/null; then echo TRUE; else echo FALSE; fi
+def main():
     parser = configure_parser()
-    args = parser.parse_args()
+    args,remainder = parser.parse_known_args()
     global LOG_LEVEL
     if args.verbose >= 3:
         LOG_LEVEL = TRACE
@@ -501,11 +1332,16 @@ def main():
     else:
         LOG_LEVEL = WARNING
     log(*sys.argv, level=DEBUG)
+    #if not args.dry_run and os.geteuid() != 0:
+    #    print(f"You need to be root to run this script")
+    #    sys.exit(NOT_ROOT)
+    #if not args.dry_run and not docker_user_chain_exists():
+    #    print(f"The {CHAIN} chain does not exist in iptables or the iptables command doesn't exist. Ensure iptables and docker are correctly configured on your system.")
     if not os.path.exists(DFW_RULES_PATH):
         log(f"{DFW_RULES_PATH} doesn't exist. Aborting!", level=CRITICAL) # Don't need to abort. I can just create it.
         sys.exit(FILE_MISSING)
     args.config = read_config()
-    sys.exit(args.func(args))
+    sys.exit(args.func(args, remainder))
 
 if __name__ == "__main__":
     main()
