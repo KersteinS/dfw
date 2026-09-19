@@ -17,10 +17,8 @@
 import argparse
 import base64
 import binascii
-from collections import deque
 import ipaddress
 import os
-import re
 import shutil
 import socket
 import string
@@ -30,7 +28,7 @@ from typing import Self
 
 # Enum Metadata
 PROGRAM_NAME="dfw"
-VERSION="0.0.4"
+VERSION="0.0.5"
 
 # Enum Logging
 TRACE=5
@@ -48,7 +46,10 @@ DFW_RULES_PATH="./etc/dfw/dfw.rules"
 
 # Enum CommandArgs
 CHAIN="DOCKER-USER"
-CHAIN6="NOT-IMPLEMENTED"
+LOG_CHAIN_DENY=f"{PROGRAM_NAME.upper()}-LOG-DENY"
+LOG_CHAIN_ALLOW=f"{PROGRAM_NAME.upper()}-LOG-ALLOW"
+LOG_PREFIX_BLOCK=f"{PROGRAM_NAME.upper()}-BLOCK:_" # I have concerns about the \" in this when trying to push to iptables
+LOG_PREFIX_ALLOW=f"{PROGRAM_NAME.upper()}-ALLOW:_" # I have concerns about the \" in this when trying to push to iptables
 RULE_COMMENT=f"-m comment --comment {PROGRAM_NAME.upper()}_ADDED_RULE"
 
 # Enum Errors
@@ -64,16 +65,8 @@ NONEXISTANT_RULE=9
 RULE_ALREADY_EXISTS=10
 INVALID_COMMAND=11
 
-RULES_HEAD_ALLOW_OUT=(
-        "-A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN\n"
-        "-A DOCKER-USER -i docker0 -j RETURN\n"
-        "-A DOCKER-USER -s 172.17.0.0/12 -j RETURN\n"
-        )
-RULES_HEAD_DENY_OUT=(
-        "-A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN\n"
-        )
-RULES_TAIL_DENY_IN="-A DOCKER-USER -j DROP"
-RULES_TAIL_ALLOW_IN="-A DOCKER-USER -j RETURN"
+RULES_TAIL_DENY_IN=f"-A DOCKER-USER -j DROP {RULE_COMMENT}"
+RULES_TAIL_ALLOW_IN=f"-A DOCKER-USER -j RETURN {RULE_COMMENT}"
 DEFAULT_IFACE="eth0" # This is set at program startup, so this value is just a fallback
 
 # To flush all DOCKER-USER chain rules: sudo iptables -F DOCKER-USER
@@ -120,7 +113,7 @@ def get_default_interface() -> str:
         for line in file.readlines():
             check = line.strip().split()
             if len(check) > 2 and check [1] == "00000000":
-                log(f"detected {check[0]} as default interface", level=TRACE)
+                log(f"detected {check[0]} as default interface", level=DEBUG)
                 return check[0]
 class Config:
 
@@ -131,10 +124,12 @@ class Config:
         "DEFAULT_INCOMING: deny\n"
         "# DEFAULT_OUTGOING: allow|deny|reject\n"
         "DEFAULT_OUTGOING: allow\n"
-        "# LOG: on|off\n"
-        "LOG: off\n"
-        "# LOG_LEVEL: low|medium|high|full\n"
-        "LOG_LEVEL: low\n"
+        "# LOGGING_LEVEL: off|low|medium|high|full\n"
+        "LOGGING_LEVEL: off\n"
+        "# IPV6_SUBNET: Disabled|[valid ipv6 subnet]\n"
+        f"# To enable ipv6 functionality for {PROGRAM_NAME}, specify a default ipv6 subnet (e.g. fe80::0/64) to be used by the default outgoing policy. As long as a valid ipv6 subnet is specified in this configuration file, {PROGRAM_NAME} will enable and allow ipv6 rules.\n"
+        "# IPV6_SUBNET can only be changed manually in the config file. It cannot be changed via the command line.\n"
+        "IPV6_SUBNET: Disabled\n"
         )
 
     def __init__(self, conf_string):
@@ -142,13 +137,13 @@ class Config:
         self._enabled = ""
         self._default_in = ""
         self._default_out = ""
-        self._log = ""
-        self._log_level = ""
-        self._old_enabled = ""
-        self._old_default_in = ""
-        self._old_default_out = ""
-        self._old_log = ""
-        self._old_log_level = ""
+        self._logging_level = ""
+        self._ipv6_subnet = ""
+        self._initial_enabled = ""
+        self._initial_default_in = ""
+        self._initial_default_out = ""
+        self._initial_logging_level = ""
+        self._intial_ipv6_subnet = ""
 
     @property
     def enabled(self):
@@ -159,15 +154,12 @@ class Config:
         errormsg = "Invalid value provided for config.enabled"
         if isinstance(value, str):
             if value == "False":
-                self._old_enabled = self.enabled
                 self._enabled = False
             elif value == "True":
-                self._old_enabled = self.enabled
                 self._enabled = True
             else:
                 raise ValueError(errormsg)
         elif isinstance(value, bool):
-            self._old_enabled = self.enabled
             self._enabled = value
         else:
             raise ValueError(errormsg)
@@ -180,7 +172,6 @@ class Config:
     def default_in(self, value):
         if value not in ("allow", "deny", "reject"):
             raise ValueError("Invalid value provided for config.default_in")
-        self._old_default_in = self._default_in
         self._default_in = value
 
     @property
@@ -191,96 +182,109 @@ class Config:
     def default_out(self, value):
         if value not in ("allow", "deny", "reject"):
             raise ValueError("Invalid value provided for config.default_out")
-        self._old_default_out = self._default_out
         self._default_out = value
 
     @property
-    def log(self):
-        return self._log
+    def logging_level(self):
+        return self._logging_level
 
-    @log.setter
-    def log(self, value):
-        errormsg = "Invalid value provided for config.log"
-        if isinstance(value, str):
-            if value == "off":
-                self._old_log = self._log
-                self._log = False
-            elif value == "on":
-                self._old_log = self._log
-                self._log = True
+    @logging_level.setter
+    def logging_level(self, value):
+        if value in ("off", "on", "low", "medium", "high", "full"):
+            if value == "on":
+                self._logging_level = "low"
             else:
-                raise ValueError(errormsg)
-        elif isinstance(value, bool):
-            self._old_log = self._log
-            self._log = value
+                self._logging_level = value
         else:
-            raise ValueError(errormsg)
+            raise ValueError("Invalid value provided for config.logging_level")
 
     @property
-    def log_level(self):
-        return self._log_level
+    def ipv6_subnet(self):
+        return self._ipv6_subnet
 
-    @log_level.setter
-    def log_level(self, value):
-        if value in ("low", "medium", "high", "full"):
-            self._old_log_level = self._log_level
-            self._log_level = value
+    @ipv6_subnet.setter
+    def ipv6_subnet(self, value):
+        if value == "Disabled":
+            self._ipv6_subnet = value
+        elif Rule.is_valid_ipv6(value):
+            # Valid example fe80::1/64
+            self._ipv6_subnet = value
         else:
-            raise ValueError("Invalid value provided for config.log_level")
+            raise ValueError("Invalid value provided for config.ipv6_subnet")
 
     @classmethod
     def parse_config_str(cls, config_str) -> Self:
         new_config = Config(config_str)
-        lines = [line for line in config_str.split("\n") if line and "#" not in line]
-        valid_configs = {
-                "ENABLED: ": ["False", "True"],
-                "DEFAULT_INCOMING: ": ["deny", "allow", "reject"],
-                "DEFAULT_OUTGOING: ": ["deny", "allow", "reject"],
-                "LOG: ": ["off", "on"],
-                "LOG_LEVEL: ": ["low", "medium", "high", "full"]
-                }
-        check_config_missing = [i[:-2] for i in valid_configs.keys()]
-        configs_to_membernames = {"ENABLED: ": "_enabled", "DEFAULT_INCOMING: ": "_default_in", "DEFAULT_OUTGOING: ": "_default_out", "LOG: ": "_log", "LOG_LEVEL: ": "_log_level"}
+        lines = [line for line in config_str.split("\n") if line and not line.startswith("#")]
+        valid_configs = ["ENABLED: ", "DEFAULT_INCOMING: ", "DEFAULT_OUTGOING: ", "LOGGING_LEVEL: ", "IPV6_SUBNET: "]
+        check_configs = valid_configs.copy()
         errormsg = "Invalid config line\n "
         for line in lines:
-            matched_key = ""
-            matched_value = ""
-            if line.startswith("#"):
-                continue
-            for valid_key,valid_values in valid_configs.items():
-                if line.startswith(valid_key):
-                    parts = line.split(valid_key)
-                    if len(parts) != 2 or parts[0] or parts[1] not in valid_values:
-                        raise ValueError(f"{errormsg}{line}")
-                    matched_key = valid_key
-                    matched_value = parts[1]
-                    if matched_value == "reject":
-                        raise ValueError(f"{PROGRAM_NAME} does not currently support \"reject\"")
+            if ": " not in line:
+                raise ValueError(errormsg+f" {line}\n Missing \": \" in line (note, whitespace after colon is required)")
+            for config in valid_configs:
+                if line.startswith(config):
+                    key = config
                     break
             else:
+                raise ValueError(f"{errormsg} \"{line}\"\nLine does not start with a valid config key.")
+            parts = line.split(key)
+            if len(parts) != 2:
                 raise ValueError(f"{errormsg}{line}")
-            if new_config.__dict__[configs_to_membernames[matched_key]]:
-                raise ValueError(f"Duplicate config line\n {line}")
-            new_config.__dict__[configs_to_membernames[matched_key]] = matched_value
-            check_config_missing.remove(matched_key[:-2])
-        if check_config_missing:
-            raise ValueError(f"Required setting(s) missing from {DFW_CONFIG_PATH}\n {', '.join(check_config_missing)}")
-        else:
-            return new_config
+            elif key not in check_configs:
+                raise ValueError(f"{errormsg} \"{line}\"\nFound more than one line with this config key.")
+            if key == valid_configs[0]:
+                try:
+                    new_config.enabled = parts[1]
+                except ValueError:
+                    raise ValueError(f"{errormsg}{line}")
+                new_config._initial_enabled = new_config.enabled # necessary because it is stored as a bool
+            elif key == valid_configs[1]:
+                try:
+                    new_config.default_in = new_config._initial_default_in = parts[1]
+                except ValueError:
+                    raise ValueError(f"{errormsg}{line}")
+            elif key == valid_configs[2]:
+                try:
+                    new_config.default_out = new_config._initial_default_out = parts[1]
+                except ValueError:
+                    raise ValueError(f"{errormsg}{line}")
+            elif key == valid_configs[3]:
+                try:
+                    new_config.logging_level = new_config._initial_logging_level = parts[1]
+                except ValueError:
+                    raise ValueError(f"{errormsg}{line}")
+            elif key == valid_configs[4]:
+                try:
+                    new_config.ipv6_subnet = new_config._initial_ipv6_subnet = parts[1]
+                except ValueError:
+                    raise ValueError(f"{errormsg}{line}")
+            check_configs.remove(key)
+        if check_configs:
+            for key in check_configs:
+                log(f"Required configuration missing: {key[:-2]}", level=CRITICAL)
+            raise ValueError(f"Invalid configuration file: {DFW_CONFIG_PATH}")
+        if "reject" in (new_config.default_in,new_config.default_out):
+            raise ValueError(f"{PROGRAM_NAME} does not currently support \"reject\"") # TODO
+        return new_config
 
     def print_updated_config(self) -> str:
-        old_membernames_to_configs = {"_old_enabled": "ENABLED: ", "_old_default_in": "DEFAULT_INCOMING: ", "_old_default_out": "DEFAULT_OUTGOING: ", "_old_log": "LOG: ", "_old_log_level": "LOG_LEVEL: "}
-        current_config = self.initial_string.split("\n")
-        for key,value in old_membernames_to_configs.items():
-            if self.__dict__[key]:
-                for index,line in enumerate(current_config):
-                    if line.startswith(value):
-                        current_config[index] = f"{value}{self.__dict__[key[4:]]}"
-                        break
-        return '\n'.join(current_config)
+        comparisons_and_keys = {
+                (self._initial_enabled, self.enabled): "ENABLED: ",
+                (self._initial_default_in, self.default_in): "DEFAULT_INCOMING: ",
+                (self._initial_default_out, self.default_out): "DEFAULT_GOING: ",
+                (self._initial_logging_level, self.logging_level): "LOGGING_LEVEL: ",
+                # (self._initial_ipv6_subnet, self.ipv6_subnet): "IPV6_SUBNET: " # IPV6_SUBNET can only be changed manually in the config file. Therefore, _initial_ipv6_subnet must always equal ipv6_subnet.
+                }
+        new_config_str = self.initial_string
+        for compare,config_key in comparisons_and_keys.items():
+            if compare[0] != compare[1]:
+                new_config_str = new_config_str.replace(f"{config_key}{compare[0]}", f"{config_key}{compare[1]}") # enabled is fine because I'm casting a bool to a str
+                return new_config_str
+        else:
+            return self.initial_string
 
 class Rule:
-    # TODO All rules need DFW_COMMENT: sudo iptables -A INPUT -p tcp --dport 22 -j RETURN "
 
     comment = ""
     modification = ""
@@ -318,6 +322,39 @@ class Rule:
                 and self.dports == other.dports
                 and self.protocol == other.protocol
                 )
+    def to_status(self, verbose_or_numbered: bool, ipv6=False) -> tuple[str]:
+        if not self.dest_addr and not self.dports:
+            to_str = "Anywhere" if self.ipv_type!="6" else "Anywhere (v6)"
+        elif self.dest_addr and not self.dports:
+            to_str = self.dest_addr
+        elif not self.dest_addr and self.dports:
+            to_str = self.dports
+        else:
+            to_str = f"{self.dest_addr} {self.dports}"
+        if self.input_interface:
+            to_str += f" on {self.input_interface}"
+        action_str = self.action.upper()
+        if verbose_or_numbered:
+            action_str += f" {self.direction.upper()}"
+        if not self.source_addr and not self.sports:
+            from_str = "Anywhere" if self.ipv_type!="6" else "Anywhere (v6)"
+        elif self.source_addr and not self.sports:
+            from_str = self.source_addr
+        elif not self.source_addr and self.sports:
+            from_str = self.sports
+        else:
+            from_str = f"{self.source_addr} {self.sports}"
+        if self.output_interface:
+            from_str += f" on {self.output_interface}"
+        if self.protocol not in ("both", "any"):
+            if ("Anywhere" in from_str and not self.dports) or self.sports:
+                from_str += f"/{self.protocol}"
+            if "Anywhere" in to_str or self.dports:
+                to_str += f"/{self.protocol}"
+        if ipv6 and self.ipv_type != "6":
+            to_str += " (v6)"
+            from_str += " (v6)"
+        return (to_str, action_str, from_str)
 
     @staticmethod
     def check_ports(ports_str):
@@ -373,7 +410,7 @@ class Rule:
         try:
             return str(socket.getservbyname(service_name))
         except OSError:
-            log(f"{service_name=} does not have a matching entry in /etc/services", level=TRACE)
+            log(f"{service_name=} does not have a matching entry in /etc/services", level=DEBUG)
             return ""
 
     @staticmethod
@@ -382,13 +419,13 @@ class Rule:
         try:
             socket.getservbyname(service_name)
         except OSError:
-            log(f"{service_name=} does not have a matching entry in /etc/services", level=TRACE)
+            log(f"{service_name=} does not have a matching entry in /etc/services", level=DEBUG)
             return ""
         try:
             socket.getservbyname(service_name, "tcp")
             proto = "tcp"
         except OSError:
-            log(f"{service_name=} does not have a matching tcp entry in /etc/services", level=TRACE)
+            log(f"{service_name=} does not have a matching tcp entry in /etc/services", level=DEBUG)
             # pass
         try:
             socket.getservbyname(service_name, "udp")
@@ -397,7 +434,7 @@ class Rule:
             else:
                 proto = "udp"
         except OSError:
-            log(f"{service_name=} does not have a matching udp entry in /etc/services", level=TRACE)
+            log(f"{service_name=} does not have a matching udp entry in /etc/services", level=DEBUG)
             # pass
         return proto
 
@@ -659,7 +696,7 @@ class Rule:
                         # value for port must be a service or port or port range. No / and protocol allowed.
                         if not cls.is_numeric_port(ports_str):
                             if "," in ports_str or ":" in ports_str:
-                                log(f"{ports_str=} and cannot contain colon or comma", level=TRACE)
+                                log(f"{ports_str=} and cannot contain colon or comma", level=DEBUG)
                                 raise ValueError("Port ranges must be numeric")
                             if next_port_or_app == "from":
                                 from_service = ports_str
@@ -862,10 +899,10 @@ class Rule:
             raise ValueError(errormsg)
         return new_rule
 
-    def print_rule_ipt(self, silent=False) -> str:
+    def print_rule_ipt(self, silent=False, logging_level="", ipv6=False) -> str:
         # print the rule as iptables rule(s)
-        if self.ipv_type == "6":
-            rules = [f"-A {CHAIN6} "]
+        if ipv6:
+            rules = [f"-A {CHAIN} "]
         else:
             rules = [f"-A {CHAIN} "]
         if self.direction == "out":
@@ -883,7 +920,7 @@ class Rule:
             else:
                 rules[0] += f"{DEFAULT_IFACE} "
                 if not silent:
-                    log(f"No input interface was provided (no \"on\" clause). Due to the implementation of the DOCKER-USER chain, the default interface to the internet ({DEFAULT_IFACE}) has been provisioned for this rule", level=WARNING)
+                    log(f"No input interface was provided (no \"on\" clause). Due to the implementation of the DOCKER-USER chain, the default interface to the internet ({DEFAULT_IFACE}) has been provisioned for this rule.", level=WARNING)
         rules[0] += "-m conntrack --ctdir ORIGINAL "
         if self.source_addr and self.source_addr != "any":
             rules[0] += f"--ctorigsrc {self.source_addr} "
@@ -893,12 +930,12 @@ class Rule:
             if "," not in self.sports:
                 rules[0] += f"--ctorigsrcport {self.sports} "
             else:
-                raise ValueError("ctorigsrcport does not support csv for port ranges, only ranges using colon (:)")
+                raise ValueError("ctorigsrcport does not support csv for port ranges, only ranges using colon (:)") # TODO
         if self.dports:
             if "," not in self.dports:
                 rules[0] += f"--ctorigdstport {self.dports} "
             else:
-                raise ValueError("ctorigdstport does not support csv for port ranges, only ranges using colon (:)")
+                raise ValueError("ctorigdstport does not support csv for port ranges, only ranges using colon (:)") #TODO
         if self.protocol == "both":
             rules.append(rules[0])
             rules[0] += "-p tcp "
@@ -915,10 +952,11 @@ class Rule:
             raise ValueError("limit action not implemented yet")
         for i in range(len(rules)):
             rules[i] += f"{action} {RULE_COMMENT}"
-        if self.ipv_type == "both" and False: # Delete and False to re-enable IPv6. At this time there is no IPv6 DOCKER-USER chain.
-            rules.append(rules[0].replace(CHAIN, CHAIN6))
-            if len(rules) == 3:
-                rules.append(rules[1].replace(CHAIN, CHAIN6))
+        if (self.log and logging_level != "off") or logging_level == "high":
+            for i in range(len(rules)):
+                rule = rules[i].split("-j")[0]
+                rules.append(rule+f"{'--ctstate NEW' if self.log=='log' else ''}{' -m limit --limit 3/min --limit-burst 10' if logging_level in ('low','medium') else ''} -j {LOG_CHAIN_DENY if self.action in ('deny','reject') else LOG_CHAIN_ALLOW} {RULE_COMMENT}")
+            rules.reverse()
         return '\n'.join(f"{i}" for i in rules)
 
     def print_rule_dfw(self) -> str:
@@ -938,7 +976,7 @@ class Rule:
                 to_clause = f" to {self.dest_addr if self.dest_addr else 'any'}{' port '+self.dports if self.dports else ''}"
                 if self.dapp:
                     to_clause += f" app {self.dapp}"
-            return f"{self.action} {self.direction}{'on '+interface if interface else ''}{self.log+' ' if self.log else ''}{from_clause}{to_clause} {'proto '+self.protocol if self.protocol not in ('both', 'any', '') else ''}"
+            return f"{self.action} {self.direction}{' on '+interface if interface else ''}{self.log+' ' if self.log else ''}{from_clause}{to_clause} {'proto '+self.protocol if self.protocol not in ('both', 'any', '') else ''}"
         else:
             port_proto = self.dports
             if self.protocol in ("tcp", "udp"):
@@ -993,7 +1031,7 @@ def write_config(config: str | Config): # I can think of no case where I need to
         config_str = config.print_updated_config()
         with open(DFW_CONFIG_PATH, "w") as conf:
             conf.write(config_str)
-    log("Wrote to dfw.conf.", level=DEBUG)
+    log("Wrote to dfw.conf.", level=INFO)
 
 def read_config() -> str:
     try:
@@ -1004,24 +1042,107 @@ def read_config() -> str:
         write_config(Config.default_config)
         return Config.default_config
 
-def make_fresh_rules_file(default_in="deny", default_out="allow") -> int:
-    content = (
-        f"# generated by {PROGRAM_NAME} version {VERSION}. Default incoming={default_in}. Default outgoing={default_out}.\n\n"
-        + (f"{RULES_HEAD_ALLOW_OUT}\n" if default_out=="allow" else f"{RULES_HEAD_DENY_OUT}\n")
-        + (f"\n\n{RULES_TAIL_DENY_IN}\n" if default_in=="deny" else f"\n\n{RULES_TAIL_ALLOW_IN}\n")
-    )
+def make_default_rules(default_in: str, default_out: str, logging_level: str, ipv6_subnet="") -> (list[str],list[str]):
+    # Log level low (all with rate limiting):
+        # deny in | allow out:
+            # (A) incoming and outgoing packets matched by log-ed rules, and (B) packets that are being dropped due to the deny-in policy. Allow-ed packets are only logged if they match the first criteria (match a log-ed rule)
+                ## (A) is achieved in print_rule_ipt
+                ## (B) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL -j DROP. That rule represents the default policy of deny incoming. The criteria of the jump must match the criteria of the subsequent DROP rule.
+        # deny in | deny out:
+            # (A) incoming and outgoing packets matched by log-ed rules, and (B) packets that are being dropped due to the deny-in or deny-out policies. Allow-ed packets are only logged if they match the first criteria (match a log-ed rule)
+                ## (A) is achieved in print_rule_ipt
+                ## (B) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL -j DROP; and putting a jump to DFW-LOG-DENY immediately before the rule: -A DOCKER-USER -s 172.17.0.0/12 -m conntrack --ctdir ORIGINAL -j DROP. Those rules represent the default policies of deny incoming and deny outgoing. The criteria of the jumps must match the criteria of their respective subsequent DROP rules.
+        # allow in | allow out:
+            # (A) incoming and outgoing packets matched by log-ed rules. No packets are dropped due to default policy
+                ## (A) is achieved in print_rule_ipt
+        # allow in | deny out:
+            # (A) incoming and outgoing packets matched by log-ed rules, and (B) packets that being dropped due to the deny-out policy. Allow-ed packets are only logged if they match the first criteria (match a log-ed rule)
+                ## (A) is achieved in print_rule_ipt
+                ## (B) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -s 172.17.0.0/12 -m conntrack --ctdir ORIGINAL -j DROP. That rule represents the default policy of deny outgoing. The criteria of the jump must match the criteria of the subsequent DROP rule.
+    # Log level medium (all with rate limiting):
+        # deny in | allow out:
+            # (A) incoming and outgoing packets matched by log-ed rules, (B) incoming packets that are being dropped only due to the deny-in policy,
+            # (C) incoming and outgoing packets that are NEW or INVALID, and (D) outgoing packets that are only allow-ed due to the allow-out policy (practical note, medium never logs established/related packets due to D).
+                ## (A) and (B) refer to low rules for this default policy set.
+                ## (C) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -m conntrack --ctstate INVALID -j DROP, and putting a jump to the DFW-LOG-ALLOW chain immediately before the rule: -A DOCKER-USER -s 172.17.0.0/12 -m conntrack --ctdir ORIGINAL -j RETURN (i.e. default policy allow out). The criteria of the jump to the DFW-LOG-DENY must match the criteria of the subsequent DROP rule. The criteria of the jump to the DFW-LOG-ALLOW chain must match the criteria of the subsequent RETURN rule and require ctstate to be NEW.
+                ## (D) is achieved implicitly by (C)
+        # deny in | deny out:
+            # (A) incoming and outgoing packets matched by log-ed rules, (B) incoming and outgoing packets that are being dropped only due to the deny-in and deny-out policies, and
+            # (C) incoming and outgoing packets that are NEW or INVALID.
+                ## (A) and (B) refer to low rules for this default policy set.
+                ## (C) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -m conntrack --ctstate INVALID -j DROP. The criteria of the jump to the DFW-LOG-DENY must match the criteria of the subsequent DROP rule.
+        # allow in | allow out:
+            # (A) incoming and outgoing packets matched by log-ed rules,
+            # (C) incoming and outgoing packets that are NEW or INVALID, and (D) incoming and outgoing packets that are being allow-ed only due to the allow-in and allow-out policies (practical note, medium never logs established/related packets due to D).
+                ## (A) refer to low rules for this default policy set.
+                ## (C) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -m conntrack --ctstate INVALID -j DROP, putting a jump to the DFW-LOG-ALLOW chain immediately before the rule: -A DOCKER-USER -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL -j RETURN (i.e. default policy allow in), and putting a jump to the DFW-LOG-ALLOW chain immediately before the rule: -A DOCKER-USER -s 172.17.0.0/12 -m conntrack --ctdir ORIGINAL -j RETURN (i.e. default policy allow out). The criteria of the jump to DFW-LOG-DENY must match the criteria of the subsequent DROP rule. The criteria of the jumps to the DFW-LOG-ALLOW chain must match the criteria of the respective subsequent RETURN rules and require ctstate for both log rules to be NEW.
+                ## (D) is achieved implicitly by (C)
+        # allow in | deny out:
+            # (A) incoming and outgoing packets matched by log-ed rules, (B) outgoing packets that are only deny-ed due to the deny-out policy,
+            # (C) incoming and outgoing packets that are NEW or INVALID, and (D) incoming packets that are being allow-ed only due to the allow-in policy.
+                ## (A) and (B) refer to low rules for this default policy set.
+                ## (C) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -m conntrack --ctstate INVALID -j DROP, and putting a jump to the DFW-LOG-ALLOW chain immediately before the rule: -A DOCKER-USER -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL -j RETURN (i.e. default policy allow in). The criteria of the jump to the DFW-LOG-DENY must match the criteria of the subsequent DROP rule. The criteria of the jump to the DFW-LOG-ALLOW chain must match the criteria of the subsequent RETURN rule and require ctstate to be NEW.
+                ## (D) is achieved implicitly by (C)
+    # Log level high (same as medium with no rate limits plus other packets that have triggered rate limiting)
+    # ufw log level high logs every packet except: any packet that has state ESTABLISHED/RELATED and any packet that matches a user defined rule that does not have log or log-all in the definition
+    # Log level full (all packets in DOCKER-USER chain are logged without rate limiting). This is achieved by adding logging to ESTABLISHED,RELATED packets and adding logging companion rules to any un-log-ed dfw rules.
+    top_rules = []
+    bottom_rules = []
+    top_rules.append(f"-A {CHAIN} -m conntrack --ctstate INVALID -j DROP {RULE_COMMENT}") # always drop invalid packets
+    top_rules.append(f"-A {CHAIN} -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN {RULE_COMMENT}") # always allow existing connections and return immediately.
+    if logging_level in ("low", "medium", "high", "full"): # add "low" logs
+        top_rules.insert(0, f"-N {LOG_CHAIN_DENY} {RULE_COMMENT}")
+        top_rules.insert(1, f"-A {LOG_CHAIN_DENY} -j LOG --log-prefix {LOG_PREFIX_BLOCK} --log-level 4 {RULE_COMMENT}")
+        top_rules.insert(0, f"-N {LOG_CHAIN_ALLOW} {RULE_COMMENT}")
+        top_rules.insert(1, f"-A {LOG_CHAIN_ALLOW} -j LOG --log-prefix {LOG_PREFIX_ALLOW} --log-level 4 {RULE_COMMENT}")
+        if default_in == "deny":
+            bottom_rules.append(f"-A {CHAIN} -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL{' -m limit --limit 3/min --limit-burst 10' if logging_level in ('low','medium') else ''} -j {LOG_CHAIN_DENY} {RULE_COMMENT}") # log packets denied due to the default deny-in policy
+        if default_out == "deny":
+            bottom_rules.append(f"-A {CHAIN} -s {'172.17.0.0/12' if not ipv6_subnet else ipv6_subnet} -m conntrack --ctdir ORIGINAL{' -m limit --limit 3/min --limit-burst 10' if logging_level in ('low','medium') else ''} -j {LOG_CHAIN_DENY} {RULE_COMMENT}") # log packets denied due to the default deny-out policy
+            bottom_rules.append(f"-A {CHAIN} -o docker0 -m conntrack --ctdir ORIGINAL{' -m limit --limit 3/min --limit-burst 10' if logging_level in ('low','medium') else ''} -j {LOG_CHAIN_DENY} {RULE_COMMENT}") # log packets denied due to the default deny-out policy
+    if logging_level in ("medium", "high", "full"): # add "medium" logs
+        # At this point top_rules is: (0) CREATE_LOG_ALLOW_CHAIN, (1) POPULATE_LOG_ALLOW_CHAIN, (2) CREATE_LOG_DENY_CHAIN, (3) POPULATE_LOG_DENY_CHAIN (4) DROP_INVALID, (5) RETURN_ESTABLISH/RELATED
+        top_rules.insert(4, f"-A {CHAIN} -m conntrack --ctstate INVALID{' -m limit --limit 3/min --limit-burst 10' if logging_level=='medium' else ''} -j {LOG_CHAIN_DENY} {RULE_COMMENT}") # log invalid packets (which are denied)
+        # now it's (0) CREATE_LOG_ALLOW_CHAIN, (2) POPULATE_LOG_ALLOW_CHAIN, (3) CREATE_LOG_BLOCK_CHAIN, (4) POPULATE_LOG_DENY_CHAIN, (5) LOG_INVALID, (3) DROP_INVALID, (4) RETURN_ESTABLISH/RELATED
+        if default_in == "allow":
+            bottom_rules.append(f"-A {CHAIN} -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL{' -m limit --limit 3/min --limit-burst 10' if logging_level=='medium' else ''} -j {LOG_CHAIN_ALLOW} {RULE_COMMENT}")
+        if default_out == "allow":
+            bottom_rules.append(f"-A {CHAIN} -s {'172.17.0.0/12' if not ipv6_subnet else ipv6_subnet} -m conntrack --ctdir ORIGINAL{' -m limit --limit 3/min --limit-burst 10' if logging_level=='medium' else ''} -j {LOG_CHAIN_ALLOW} {RULE_COMMENT}")
+            bottom_rules.append(f"-A {CHAIN} -o docker0 -m conntrack --ctdir ORIGINAL{' -m limit --limit 3/min --limit-burst 10' if logging_level=='medium' else ''} -j {LOG_CHAIN_ALLOW} {RULE_COMMENT}")
+    if logging_level in ("high", "full"):
+        pass # TODO log packets that have triggered rate limiting
+    if logging_level == "full":
+        top_rules.insert(4, f"-A {CHAIN} -m conntrack --ctstate ESTABLISHED,RELATED -j {LOG_CHAIN_ALLOW} {RULE_COMMENT}")
+    if default_in == "deny":
+        bottom_rules.append(f"-A {CHAIN} -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL -j DROP {RULE_COMMENT}") # deny anything in that is incoming on the default interface
+    else: # default_in == "allow"
+        bottom_rules.append(f"-A {CHAIN} -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL -j RETURN {RULE_COMMENT}") # allow anything in that is incoming on the default interface
+    if default_out == "allow":
+        bottom_rules.append(f"-A {CHAIN} -s {'172.17.0.0/12' if not ipv6_subnet else ipv6_subnet} -m conntrack --ctdir ORIGINAL -j RETURN {RULE_COMMENT}") # allow out anything originating from the default docker address range
+        bottom_rules.append(f"-A {CHAIN} -o docker0 -m conntrack --ctdir ORIGINAL -j RETURN {RULE_COMMENT}") # allow out anything originating from the default docker address range
+    else: # default_out == "deny"
+        bottom_rules.append(f"-A {CHAIN} -s {'172.17.0.0/12' if not ipv6_subnet else ipv6_subnet} -m conntrack --ctdir ORIGINAL -j DROP {RULE_COMMENT}") # deny anything originating from the default docker address range
+        bottom_rules.append(f"-A {CHAIN} -o docker0 -m conntrack --ctdir ORIGINAL -j DROP {RULE_COMMENT}") # deny anything originating from the default docker address range
+    # security: drop anything that makes it past the above handling, just to be safe...
+    if logging_level in ("low","medium","high","full"):
+        bottom_rules.append(f"-A {CHAIN}{' -m limit --limit 3/min --limit-burst 10' if logging_level in ('low','medium') else ''} -j {LOG_CHAIN_DENY}")
+    bottom_rules.append(f"-A {CHAIN} -j DROP {RULE_COMMENT}")
+    return top_rules,bottom_rules
+
+def make_fresh_rules_file(conf: Config) -> int:
+    content = generate_rules_text([], conf)
     with open(DFW_RULES_PATH, "w") as rules_file:
         rules_file.writelines(content)
-    log("Wrote new dfw.rules.", level=DEBUG)
+    log("Wrote new dfw.rules.", level=INFO)
 
 def read_rules_file() -> (list[str], int):
     rules_list = []
     try:
         with open(DFW_RULES_PATH, "r") as rules_file:
             for line in rules_file.readlines():
-                if line.startswith("[RULEFORM]"):
+                if line.startswith("[RULEFORM]") and line not in rules_list: # exclude duplicate rules from IPv6 section
                     rules_list.append(line)
-        log("Read rules file successfully", level=TRACE)
+        log("Read rules file successfully", level=DEBUG)
         return rules_list, 0
     except FileNotFoundError:
         log(f"Reading {DFW_RULES_PATH} failed due to missing file. Aborting!", level=CRITICAL)
@@ -1030,14 +1151,15 @@ def read_rules_file() -> (list[str], int):
 def write_rules_file(content: str, action: str) -> int:
     try:
         shutil.copy2(DFW_RULES_PATH, DFW_RULES_PATH+".bak")
-        log("Made backup of dfw.rules.", level=DEBUG)
+        log("Made backup of dfw.rules.", level=INFO)
     except FileNotFoundError:
         log(f"Couldn't back up {DFW_RULES_PATH} due to missing file. Aborting!", level=CRITICAL)
         return FILE_MISSING
     with open(DFW_RULES_PATH, "w") as rules_file:
         rules_file.writelines(content)
-    log("Wrote to dfw.rules.", level=DEBUG)
-    print(action)
+    log("Wrote to dfw.rules.", level=INFO)
+    if action:
+        print(action)
     return 0
 
 def request_confirmation(prompt: str) -> bool:
@@ -1048,16 +1170,36 @@ def request_confirmation(prompt: str) -> bool:
         elif check.lower() == "n":
             return False
 
-def process_rule(new_rule: Rule, default_in="deny", default_out="allow") -> (str,str,int):
-    # Rule context:
-    # -A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN # Allow containers to reach out
-    # -A DOCKER-USER -i docker0 -j RETURN # allow docker-internal comms part 1 (by interface)
-    # -A DOCKER-USER -s 172.17.0.0/12 -j RETURN # allow docker-internal comms part 2 (by subnet)
-    # append all other rules here
-    # -A DOCKER-USER -j DROP # drop all other conns # This is the default action line. So it can be RETURN or DROP (allow or deny)
-    rules_str_list,check = read_rules_file()
-    if check != 0:
-        return "","",check
+def generate_rules_text(rules: list[Rule], conf: Config) -> str:
+    top_rules, bottom_rules = make_default_rules(conf.default_in, conf.default_out, conf.logging_level)
+    content = (
+            f"# generated by {PROGRAM_NAME} version {VERSION}. Default incoming={conf.default_in}. Default outgoing={conf.default_out}. Logging level={conf.logging_level}. ipv6_subnet={conf.ipv6_subnet}.\n\n"
+            + "# Standard rules\n"
+            + '\n'.join(rule.replace(":_", ": ") for rule in top_rules)
+            + ("\n\n# User rules\n" if len(rules) else '')
+            + ('\n\n'.join(f"{rule.print_rule_form()}\n{rule.print_rule_ipt(True, conf.logging_level)}" for rule in rules if rule.ipv_type in ("4", "both")) if len(rules) else '')
+            + "\n\n# Default Policy rules\n"
+            + '\n'.join(bottom_rules)
+            + "\n\n"
+            )
+    if conf.ipv6_subnet != "Disabled":
+        top_rules6, bottom_rules6 = make_default_rules(conf.default_in, conf.default_out, conf.logging_level, conf.ipv6_subnet)
+        content += (
+            "# IPv6 standard rules\n"
+            + '\n'.join(rule.replace(":_", ": ") for rule in top_rules6)
+            + ("\n\n# IPv6 User rules\n" if len(rules) else '')
+            + ('\n\n'.join(f"{rule.print_rule_form()}\n{rule.print_rule_ipt(True, conf.logging_level, ipv6=True)}" for rule in rules if rule.ipv_type in ("6", "both")) if len(rules) else '')
+            + "\n\n# IPv6 Default Policy rules\n"
+            + '\n'.join(bottom_rules6)
+            + "\n\n"
+                )
+
+    return content
+
+def process_rule(new_rule: Rule, conf: Config) -> (str,str,int):
+    rules_str_list,err_code = read_rules_file()
+    if err_code != 0:
+        return "","",err_code
     rules = []
     for rule_str in rules_str_list:
         try:
@@ -1098,27 +1240,57 @@ def process_rule(new_rule: Rule, default_in="deny", default_out="allow") -> (str
                 summary = "duplicate"
                 break
         else:
-            summary = "Rule added"
+            if new_rule.ipv_type in ("4", "both"):
+                summary = "Rule added"
+            if config.ipv6_subnet != "Disabled":
+                summary += "Rule added (v6)"
         if "updated" in summary and not new_rule.modification: # valid rule comment update detected
             rules[index] = new_rule
         elif new_rule.modification in ("insert","prepend"):
             if summary in ("Rule updated", "duplicate"): # cannot update an existing rule via insert/prepend
-                log("Skipping inserting existing rule", level=WARNING)
+                if new_rule.ipv_type in ("4", "both"):
+                    log("Skipping inserting existing rule", level=WARNING)
+                if config.ipv6_subnet != "Disabled" and new_rule.ipv_type in ("both", "6"):
+                    log("Skipping inserting existing rule (v6)", level=WARNING)
                 return "","",RULE_ALREADY_EXISTS
             index = 1 if new_rule.modification == "prepend" else int(new_rule.insert_index)
             rules.insert(index-1, new_rule)
         elif summary == "duplicate":
-            log("Skipping adding existing rule", level=WARNING)
+            if new_rule.ipv_type in ("4", "both"):
+                log("Skipping adding existing rule", level=WARNING)
+            if config.ipv6_subnet != "Disabled":
+                log("Skipping adding existing rule (v6)", level=WARNING)
             return "","",RULE_ALREADY_EXISTS
         else:
             rules.append(new_rule)
-    content = (
-        f"# generated by {PROGRAM_NAME} version {VERSION}. Default incoming={default_in}. Default outgoing={default_out}.\n\n"
-        + (f"{RULES_HEAD_ALLOW_OUT}\n" if default_out=="allow" else f"{RULES_HEAD_DENY_OUT}\n")
-        + '\n\n'.join(f"{rule.print_rule_form()}\n{rule.print_rule_ipt(True)}" for rule in rules)
-        + (f"\n\n{RULES_TAIL_DENY_IN}\n" if default_in=="deny" else f"\n\n{RULES_TAIL_ALLOW_IN}\n")
-    )
+    content = generate_rules_text(rules, conf)
     return content,summary,0
+
+def rules_file_is_valid(conf: Config) -> (bool, int):
+    try:
+        with open(DFW_RULES_PATH, "r") as rules_file:
+            line = rules_file.readline().strip()
+        log("Read rules file first line successfully", level=DEBUG)
+        return line == f"# generated by {PROGRAM_NAME} version {VERSION}. Default incoming={conf.default_in}. Default outgoing={conf.default_out}. Logging level={conf.logging_level}. ipv6_subnet={conf.ipv6_subnet}.",0
+    except FileNotFoundError:
+        log(f"Reading {DFW_RULES_PATH} failed due to missing file. Aborting!", level=CRITICAL)
+        return False, FILE_MISSING
+
+def regenerate_rules_file(conf: Config) -> int:
+    rules_str_list,err_code = read_rules_file()
+    if err_code != 0:
+        return err_code
+    rules = []
+    for rule_str in rules_str_list:
+        try:
+            rule = Rule.parse_rule_form(rule_str)
+        except ValueError as e:
+            log(f"ERROR: {e} in {DFW_RULES_PATH}", level=ERROR)
+            return RULE_INVALID
+        rules.append(rule)
+    content = generate_rules_text(rules, conf)
+    write_rules_file(content,"")
+    return 0
 
 def status_is_enabled() -> (bool, int):
     #TODO
@@ -1131,20 +1303,58 @@ def status_is_enabled() -> (bool, int):
         print(f"Exception occurred: {e}")
         return False, 1
 
-def flush_chain(chain: str) -> int:
+def chain_exists(chain: str, version="4") -> bool:
     try:
-        log(f"flushing chain: {chain}", level=DEBUG)
-        result = subprocess.run(["iptables", "-F", chain], capture_output=True, text=True, check=True)
+        if version not in ("4","6"):
+            raise ValueError(f"Invalid value for version: {version}")
+        log(f"Checking for existance of ipv{version} chain: {chain}", level=DEBUG)
+        iptables = "iptables" if version == "4" else "ip6tables"
+        result = subprocess.run([iptables, "-L", f"{chain}", "-n"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+def read_chain(chain: str, version="4") -> (str, int):
+    try:
+        if version not in ("4","6"):
+            raise ValueError(f"Invalid value for version: {version}")
+        log(f"Reading ipv{version} chain: {chain}", level=DEBUG)
+        iptables = "iptables" if version == "4" else "ip6tables"
+        result = subprocess.run([iptables, "-L", chain, "-v", "-n"], capture_output=True, text=True, check=True)
+        return result.stdout,result.returncode
+    except subprocess.CalledProcessError as e:
+        log(f"List command failed for chain: {chain}.\n Error: {e.stderr}", level=CRITICAL)
+        return "",IPTABLES_ERROR
+
+def flush_chain(chain: str, version="4") -> int:
+    try:
+        if version not in ("4","6"):
+            raise ValueError(f"Invalid value for version: {version}")
+        log(f"Flushing ipv{version} chain: {chain}", level=DEBUG)
+        iptables = "iptables" if version == "4" else "ip6tables"
+        result = subprocess.run([iptables, "-F", chain], capture_output=True, text=True, check=True)
         return result.returncode
     except subprocess.CalledProcessError as e:
-        log(f"Flush command failed: {cmd}\n Error: {e.stderr}", CRITICAL)
+        log(f"Flush command failed for chain: {chain}.\n Error: {e.stderr}", level=CRITICAL)
+        return IPTABLES_ERROR
+
+def delete_chain(chain: str, version="4") -> int:
+    try:
+        if version not in ("4","6"):
+            raise ValueError(f"Invalid value for version: {version}")
+        log(f"Deleting ipv{version} chain: {chain}", level=DEBUG)
+        iptables = "iptables" if version == "4" else "ip6tables"
+        result = subprocess.run([iptables, "-X", chain], capture_output=True, text=True, check=True)
+        return result.returncode
+    except subprocess.CalledProcessError as e:
+        log(f"Delete command failed for chain: {chain}.\n Error: {e.stderr}", level=CRITICAL)
         return IPTABLES_ERROR
 
 # I need to make sure that if docker restarts, this application detects that and re-applies the rules. docker restart flushes the DOCKER_USER chain, you see.
-def push_rules_to_iptables(default_in: str, default_out: str) -> int:
-    rules_str_list,check = read_rules_file()
-    if check != 0:
-        return check
+def push_rules_to_iptables(conf: Config) -> int:
+    rules_str_list,err_code = read_rules_file()
+    if err_code != 0:
+        return err_code
     rules = []
     for rule_str in rules_str_list:
         try:
@@ -1154,40 +1364,124 @@ def push_rules_to_iptables(default_in: str, default_out: str) -> int:
             return "","",RULE_INVALID
         rules.append(rule)
     cmds = []
-    if default_out == "allow":
-        out_rule = RULES_HEAD_ALLOW_OUT
-    else:
-        out_rule = RULES_HEAD_DENY_OUT
-    if default_in == "deny":
-        in_rule = RULES_TAIL_DENY_IN
-    else:
-        in_rule = RULES_TAIL_ALLOW_IN
-    cmds.extend(f"iptables {rule}" for rule in out_rule.split("\n") if rule)
-    cmds.extend(f"iptables {line}" for rule in rules for line in rule.print_rule_ipt(True).split("\n") if line)
-    cmds.extend(f"iptables {rule}" for rule in in_rule.split("\n") if rule)
-    log(f"{cmds=}", level=DEBUG)
-    if (check := flush_chain(CHAIN)):
-        return check
+    top_rules, bottom_rules = make_default_rules(conf.default_in, conf.default_out, conf.logging_level)
+    cmds.extend(f"iptables {rule}" for rule in top_rules)
+    cmds.extend(f"iptables {line}" for rule in rules for line in rule.print_rule_ipt(True, conf.logging_level).split("\n") if line and rule.ipv_type in ("4","both"))
+    cmds.extend(f"iptables {rule}" for rule in bottom_rules)
+    log(f"{cmds=}", level=TRACE)
+    if (err_code := flush_chain(CHAIN)):
+        return err_code
+    for chain in (LOG_CHAIN_ALLOW, LOG_CHAIN_DENY):
+        if chain_exists(chain):
+            if (err_code := flush_chain(chain)):
+                return err_code
+            if (err_code := delete_chain(chain)):
+                return err_code
     for cmd in cmds:
         try:
-            cmd_list = cmd.split()
-            log(f"calling run with {cmd_list=}", level=DEBUG)
+            cmd_list = [i.replace(":_", ": ") for i in cmd.split()]
+            log(f"calling run with {cmd_list=}", level=TRACE)
             result = subprocess.run(cmd_list, capture_output=True, text=True, check=True)
         except subprocess.CalledProcessError as e:
-            log(f"Command failed: {cmd}\n Error: {e.stderr}", CRITICAL)
+            log(f"Command failed: {cmd}\n Error: {e.stderr}", level=CRITICAL)
             return IPTABLES_ERROR
+    if chain_exists(CHAIN, "6") and conf.ipv6_subnet != "Disabled":
+        cmds6 = []
+        top_rules6, bottom_rules6 = make_default_rules(conf.default_in, conf.default_out, conf.logging_level, conf.ipv6_subnet)
+        cmds6.extend(f"ip6tables {rule}" for rule in top_rules6)
+        cmds6.extend(f"ip6tables {line}" for rule in rules for line in rule.print_rule_ipt(True, conf.logging_level).split("\n") if line and rule.ipv_type in ("6", "both"))
+        cmds6.extend(f"ip6tables {rule}" for rule in bottom_rules6)
+        log(f"{cmds6=}", level=TRACE)
+        if (err_code := flush_chain(CHAIN, "6")):
+            return err_code
+        for chain in (LOG_CHAIN_ALLOW, LOG_CHAIN_DENY):
+            if chain_exists(chain, "6"):
+                if (err_code := flush_chain(chain, "6")):
+                    return err_code
+                if (err_code := delete_chain(chain, "6")):
+                    return err_code
+        for cmd6 in cmds6:
+            try:
+                cmd6_list = [i.replace(":_", ": ") for i in cmd6.split()]
+                log(f"calling run with {cmd6_list=}", level=TRACE)
+                result = subprocess.run(cmd6_list, capture_output=True, text=True, check=True)
+            except subprocess.CalledProcessError as e:
+                log(f"Command failed: {cmd6}\n Error: {e.stderr}", level=CRITICAL)
+                return IPTABLES_ERROR
     return 0
+
+def generate_statuses(numbered: bool, verbose: bool, ipv6_enabled:bool, logging_level="", default_in="", default_out="") -> str:
+    rules_str_list,err_code = read_rules_file()
+    if err_code != 0:
+        return err_code
+    rules = []
+    for rule_str in rules_str_list:
+        try:
+            rule = Rule.parse_rule_form(rule_str)
+        except ValueError as e:
+            log(f"ERROR: {e} in {DFW_RULES_PATH}", level=ERROR)
+            return "","",RULE_INVALID
+        rules.append(rule)
+    if numbered == True:
+        statuses = [[str(index+1), *rule.to_status(True)] for index,rule in enumerate(rules) if rule.ipv_type in ("4", "both")]
+        if ipv6_enabled:
+            statuses.extend([[str(index+1), *rule.to_status(True, True)] for index,rule in enumerate(rules) if rule.ipv_type in ("6", "both")])
+    else:
+        statuses = [rule.to_status(verbose) for rule in rules if rule.ipv_type in ("4", "both")]
+        if ipv6_enabled:
+            statuses.extend([rule.to_status(verbose, True) for rule in rules if rule.ipv_type in ("6", "both")])
+    sep = 7
+    headers = ["To", "Action", "From\n"]
+    if numbered:
+        num_digits = len(str(len(statuses)))
+        headers[0] = " "*(num_digits+3)+headers[0]
+        for status in statuses:
+            status[1] = f"[{' '*(num_digits-len(status[0]))}{status[0]}] {status[1]}"
+            del status[0]
+    max_lens = []
+    for i in range(3):
+        max_lens.append(max(len(status_parts[i]) for status_parts in statuses))
+    header_padding = (' '*(max_lens[0]-len(headers[0])+sep), ' '*(max_lens[1]-len(headers[1])+sep))
+    headers.insert(1, header_padding[0])
+    headers.insert(3, header_padding[1])
+    padded_statuses = []
+    for status_parts in statuses:
+        padded_parts = []
+        for i in range(3):
+            padded_parts.append(status_parts[i]+" "*(max_lens[i]-len(status_parts[i])))
+        padded_statuses.append(tuple(padded_parts))
+    joined_headers = ''.join(headers)
+    if verbose:
+        content = f"Status: active\nLogging: {logging_level}\nDefault: {default_in} (incoming), {default_out} (outgoing)\nNew profiles: skip\n\n" + joined_headers
+        # TODO when adding support for applications, change the logic for New profiles in the line above, although skip is the recommended behavior, so I may just make it the only option...
+    else:
+        content = "Status: active\n\n" + joined_headers
+    if numbered and ipv6_enabled:
+        content = "Note: a user rule that applies to both ipv4 and ipv6 is stored as one rule internally.\n      Therefore, the numbered list has duplicate numbers for ipv4+ipv6 rules as two lines correspond to the same rule.\n"+ content
+    dash_line = ''.join([" " if char in (" ", "\n") else "-" for char in joined_headers]) + "\n"
+    content += dash_line
+    for status_parts in padded_statuses:
+        content += f"{status_parts[0]}{' '*sep}{status_parts[1]}{' '*sep}{status_parts[2]}\n"
+    return content
 
 def enable_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     # TODO needs to also enable the start-up procedure (systemd unit?)
     log(f"{args=}", level=TRACE)
+    if args.config.enabled:
+        log(f"{PROGRAM_NAME} is already enabled.", level=WARNING)
+        return 0
     args.config.enabled = True
     if not args.dry_run:
-        if (check := confirm_root_and_chain()):
-            return check
+        if (err_code := confirm_root_and_chain()):
+            return err_code
         write_config(args.config)
-        if (check := push_rules_to_iptables(args.config.default_in, args.config.default_out)):
-            return check
+        is_valid,err_code = rules_file_is_valid(args.config)
+        if err_code != 0:
+            return err_code
+        if not is_valid and (err_code := regenerate_rules_file(args.config)):
+            return err_code
+        if (err_code := push_rules_to_iptables(args.config)):
+            return err_code
         print("Firewall is active [TRUE] and enabled on system startup [FALSE]")
     return 0
 
@@ -1196,11 +1490,30 @@ def disable_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     log(f"{args=}", level=TRACE)
     args.config.enabled = False
     if not args.dry_run:
-        if (check := confirm_root_and_chain()):
-            return check
+        if (err_code := confirm_root_and_chain()):
+            return err_code
         write_config(args.config)
-        if (check := flush_chain(CHAIN)):
-            return check
+        is_valid,err_code = rules_file_is_valid(args.config)
+        if err_code != 0:
+            return err_code
+        if not is_valid and (err_code := regenerate_rules_file(args.config)):
+            return err_code
+        if (err_code := flush_chain(CHAIN)):
+            return err_code
+        for chain in (LOG_CHAIN_ALLOW, LOG_CHAIN_DENY):
+            if chain_exists(chain):
+                if (err_code := flush_chain(chain)):
+                    return err_code
+                if (err_code := delete_chain(chain)):
+                    return err_code
+        if (err_code := flush_chain(CHAIN, "6")):
+            return err_code
+        for chain in (LOG_CHAIN_ALLOW, LOG_CHAIN_DENY):
+            if chain_exists(chain, "6"):
+                if (err_code := flush_chain(chain, "6")):
+                    return err_code
+                if (err_code := delete_chain(chain, "6")):
+                    return err_code
         print("Firewall stopped [TRUE] and disabled on system startup [FALSE]")
     return 0
 
@@ -1214,6 +1527,7 @@ def default_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
         log("ERROR: Invalid Syntax", level=ERROR)
         return INVALID_COMMAND
     if remainder[0] == "reject":
+        # TODO support reject
         log(f"{PROGRAM_NAME} does not currently support \"reject\"", level=CRITICAL)
         return FEATURE_INCOMPLETE
     if remainder[1] == "incoming":
@@ -1221,21 +1535,48 @@ def default_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     else:
         args.config.default_out = remainder[0]
     if not args.dry_run:
-        if (check := confirm_root_and_chain()):
-            return check
+        if (err_code := confirm_root_and_chain()):
+            return err_code
         write_config(args.config)
-        return push_rules_to_iptables(args.config.default_in, args.config.default_out)
+        if (err_code := regenerate_rules_file(args.config)):
+            return err_code
+        if args.config.enabled:
+            return push_rules_to_iptables(args.config)
+        else:
+            print(f"Note: {PROGRAM_NAME} is disabled. Operation not applied to live firewall.")
     return 0
 
 def logging_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
-    # TODO write_config call
     # logging on|off|LEVEL
     #        toggle  logging.  Logged  packets use the LOG_KERN syslog facility. Systems configured for rsyslog support may also
     #        log to /var/log/ufw.log. Specifying a LEVEL turns logging on for the specified LEVEL.  The  default  log  level  is
     #        'low'.  See LOGGING for details.
     log(f"{args=}", level=TRACE)
-    log(f"{args.dry_run=}", level=DEBUG)
-    log("This operation is not yet implemented", level=WARNING)
+    if len(remainder) != 1 or remainder[0] not in ("off", "on", "low", "medium", "high", "full"):
+        log("ERROR: Invalid Syntax", level=WARNING)
+        return INVALID_COMMAND
+    if args.config.logging_level == remainder[0] or remainder[0] == "on" and args.config.logging_level != "off":
+        print(f"Logging is already set to {remainder[0]}. No changes made.")
+        return 0
+    try:
+        args.config.logging_level = remainder[0]
+    except ValueError as e:
+        log(f"ERROR: Invalid Syntax: {e}", level=WARNING)
+        return INVALID_COMMAND
+    if not args.dry_run:
+        if (err_code := confirm_root_and_chain()):
+            return err_code
+        write_config(args.config)
+        if (err_code := regenerate_rules_file(args.config)):
+            return err_code
+        if args.config.logging_level != "off":
+            print("Logging enabled")
+        else:
+            print("Logging disabled")
+        if args.config.enabled:
+            return push_rules_to_iptables(args.config)
+        else:
+            print(f"Note: {PROGRAM_NAME} is disabled. Operation not applied to live firewall.")
     return 0
 
 def rule_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
@@ -1252,26 +1593,24 @@ def rule_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
         log(f"ERROR: {e}", level=ERROR)
         return RULE_INVALID
     log(f"{rule.__dict__}", level=TRACE)
-    new_rules,summary,check = process_rule(rule, args.config.default_in, args.config.default_out)
-    if check != 0:
-        return check
+    new_rules,summary,err_code = process_rule(rule, args.config)
+    if err_code != 0:
+        return err_code
     # perform some checks and provide clarity to the user
     if rule.modification in ("", "insert", "prepend"): # if we're adding a new rule
         if rule != Rule.parse_rule_form(rule.print_rule_form()):
             log(f"{rule.__dict__=}\nvs\n{Rule.parse_rule_form(rule.print_rule_form()).__dict__=}", level=ERROR)
             log("ERROR: Internal consistency check failed!", level=ERROR)
             return INTERNAL_ERROR
-        if rule.ipv_type == "6":
-            log(f"ERROR: IPv6 is not supported by docker, therefore {PROGRAM_NAME} does not allow IPv6 addresses.", level=ERROR)
-            return RULE_INVALID
-        elif rule.ipv_type == "both":
-            log(f"WARNING: IPv6 is not supported by docker, therefore the provided rule will only apply to IPv4.", level=WARNING)
-        if rule.action:
-            log(f"{rule.print_rule_ipt()}", level=TRACE)
+        if rule.action and not args.dry_run:
+            log(f"{rule.print_rule_ipt(logging_level=args.config.logging_level)}", level=TRACE)
     if not args.dry_run:
-        if check := (confirm_root_and_chain() or write_rules_file(new_rules,summary)):
-            return check
-        return push_rules_to_iptables(args.config.default_in, args.config.default_out)
+        if err_code := (confirm_root_and_chain() or write_rules_file(new_rules,summary)):
+            return err_code
+        if args.config.enabled:
+            return push_rules_to_iptables(args.config)
+        else:
+            print(f"Note: {PROGRAM_NAME} is disabled. Operation not applied to live firewall.")
     else:
         print(new_rules, summary, sep="\n")
         return 0
@@ -1279,76 +1618,153 @@ def rule_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
 def reload_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     log(f"{args=}", level=TRACE)
     if not args.dry_run:
-        push_rules_to_iptables(args.config.default_in, args.config.default_out)
+        is_valid,err_code = rules_file_is_valid(args.config)
+        if err_code != 0:
+            return err_code
+        if not is_valid and (err_code := regenerate_rules_file(args.config)):
+            return err_code
+        if args.config.enabled:
+            push_rules_to_iptables(args.config)
     return 0
 
 def reset_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     log(f"{args=}", level=TRACE)
-    log("This operation is not yet implemented", level=WARNING)
+    write_config(Config.default_config)
+    if (err_code := flush_chain(CHAIN)):
+        return err_code
+    if (err_code := flush_chain(CHAIN, "6")):
+        return err_code
+    for chain in (LOG_CHAIN_ALLOW, LOG_CHAIN_DENY):
+        if chain_exists(chain):
+            if (err_code := flush_chain(chain)):
+                return err_code
+            if (err_code := delete_chain(chain)):
+                return err_code
+        if chain_exists(chain, "6"):
+            if (err_code := flush_chain(chain, "6")):
+                return err_code
+            if (err_code := delete_chain(chain, "6")):
+                return err_code
+    write_rules_file("", "All configurations and rules reset to default")
     return 0
 
 def status_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     log(f"{args=}", level=TRACE)
-    log("This operation is not yet implemented", level=WARNING)
+    if not args.config.enabled:
+        print(f"Status: inactive")
+        return 0
+    content = generate_statuses(False, False, args.config.ipv6_subnet!="Disabled")
+    print(content)
     return 0
 
 def status_numbered_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     log(f"{args=}", level=TRACE)
-    log("This operation is not yet implemented", level=WARNING)
+    if not args.config.enabled:
+        print(f"Status: inactive")
+        return 0
+    content = generate_statuses(True, False, args.config.ipv6_subnet!="Disabled")
+    print(content)
     return 0
 
 def status_verbose_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     log(f"{args=}", level=TRACE)
-    log("This operation is not yet implemented", level=WARNING)
+    if not args.config.enabled:
+        print(f"Status: inactive")
+        return 0
+    content = generate_statuses(False, True, args.config.ipv6_subnet!="Disabled", args.config.logging_level, args.config.default_in, args.config.default_out)
+    print(content)
     return 0
 
 def show_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     log(f"{args=}", level=TRACE)
-    log("This operation is not yet implemented", level=WARNING)
+    # TODO Add support for other reports supported by ufw (low priority)
+    if len(remainder) != 1 or remainder[0] not in ("raw", "added"):
+        log("Invalid syntax", level=CRITICAL)
+        return INVALID_COMMAND
+    report = remainder[0]
+    if report == "raw":
+        content = "IPv4:\n"
+        content_extra,err_code = read_chain(CHAIN)
+        if err_code:
+            return err_code
+        content += content_extra
+        for chain in (LOG_CHAIN_DENY, LOG_CHAIN_ALLOW):
+            if chain_exists(chain):
+                content_extra,err_code = read_chain(chain)
+                if err_code:
+                    return err_code
+                content += content_extra
+        if chain_exists(CHAIN, "6") and args.config.ipv6_subnet != "Disabled":
+            content_extra,err_code = read_chain(CHAIN, "6")
+            if err_code:
+                return err_code
+            content += "IPv6:\n"
+            content += content_extra
+            for chain in (LOG_CHAIN_DENY, LOG_CHAIN_ALLOW):
+                if chain_exists(chain, "6"):
+                    content_extra,err_code = read_chain(chain, "6")
+                    if err_code:
+                        return err_code
+                    content += content_extra
+    if report == "added":
+        rules_str_list,err_code = read_rules_file()
+        if err_code != 0:
+            return err_code
+        rules = []
+        for rule_str in rules_str_list:
+            try:
+                rule = Rule.parse_rule_form(rule_str)
+            except ValueError as e:
+                log(f"ERROR: {e} in {DFW_RULES_PATH}", level=ERROR)
+                return RULE_INVALID
+            rules.append(rule)
+        content = f"Added user rules (see \"{PROGRAM_NAME} status\" for running firewall):\n"
+        content += '\n'.join(f"{PROGRAM_NAME} {rule.print_rule_dfw()}" for rule in rules)
+    print(content)
     return 0
 
 def version_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     log(f"{args=}", level=TRACE)
-    print(get_version_string()) # print here because it should always show regardless of log level.
+    print(get_version_string())
     return 0
 
 def configure_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=PROGRAM_NAME, description="CLI tool accepting ufw-like commands to modify ufw's after.rules file to support adding firewall rules that docker will respect.")
+    parser = argparse.ArgumentParser(prog=PROGRAM_NAME, description="CLI tool accepting ufw-like commands to create firewall rules that docker will respect.")
     parser.add_argument("-d", "--dry-run", action="store_true", help="Run using given input without making any change to the system. This also attempts to test the provided command for validity.")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="Enable verbose logging (repeat up to 3x for increased verbosity).")
-    parser.add_argument("-s", "--suppress", action="count", default=0, help="Suppress error messages (repeat up to 2x to suppress all messages")
+    parser.add_argument("-s", "--suppress", action="count", default=0, help="Suppress error messages (repeat up to 2x to suppress all log messages")
     parser.add_argument("-V", "--version", action="version", version=get_version_string())
 
     subparsers = parser.add_subparsers(dest="command", required=True, help="Provide the command to run")
 
-    enable_parser = subparsers.add_parser("enable", help="Adds previously defined rules to ufw's after.rules file.")
+    enable_parser = subparsers.add_parser("enable", help=f"Enables {PROGRAM_NAME} immediately and at startup.")
     enable_parser.set_defaults(func=enable_func)
 
-    disable_parser = subparsers.add_parser("disable", help=f"Removes all rules added by {PROGRAM_NAME} from ufw's after.rules file.")
+    disable_parser = subparsers.add_parser("disable", help=f"Disables {PROGRAM_NAME} immediately and at startup.")
     disable_parser.set_defaults(func=disable_func)
 
     default_parser = subparsers.add_parser("default", help="")
     default_parser.set_defaults(func=default_func)
 
-    logging_parser = subparsers.add_parser("logging", help="") # may be redundant with --verbose?
+    logging_parser = subparsers.add_parser("logging", help="")
     logging_parser.set_defaults(func=logging_func)
 
-    rule_parser = subparsers.add_parser("rule", help=f"Add a rule {PROGRAM_NAME}.")
+    rule_parser = subparsers.add_parser("rule", help=f"Add a rule.")
     rule_parser.set_defaults(func=rule_func)
 
-    allow_parser = subparsers.add_parser("allow", help=f"Adds an allow rule to ufw's after.rules file.")
+    allow_parser = subparsers.add_parser("allow", help=f"Adds an allow rule.")
     allow_parser.set_defaults(func=rule_func)
 
-    deny_parser = subparsers.add_parser("deny", help="Adds a deny rule to ufw's after.rules file.")
+    deny_parser = subparsers.add_parser("deny", help="Adds a deny rule.")
     deny_parser.set_defaults(func=rule_func)
 
-    reject_parser = subparsers.add_parser("reject", help="Adds a reject rule to ufw's after.rules file.")
+    reject_parser = subparsers.add_parser("reject", help="Adds a reject rule.")
     reject_parser.set_defaults(func=rule_func)
 
-    limit_parser = subparsers.add_parser("limit", help="Adds a limit rule to ufw's after.rules file.")
+    limit_parser = subparsers.add_parser("limit", help="Adds a limit rule.")
     limit_parser.set_defaults(func=rule_func)
 
-    delete_parser = subparsers.add_parser("delete", help="Deletes the specified rule from ufw's after.rules file.")
+    delete_parser = subparsers.add_parser("delete", help="Deletes the specified rule.")
     delete_parser.set_defaults(func=rule_func)
 
     insert_parser = subparsers.add_parser("insert", help="")
@@ -1357,18 +1773,18 @@ def configure_parser() -> argparse.ArgumentParser:
     prepend_parser = subparsers.add_parser("prepend", help="")
     prepend_parser.set_defaults(func=rule_func)
 
-    reload_parser = subparsers.add_parser("reload", help=f"Removes and re-adds all {PROGRAM_NAME}-added rules from/to ufw's after.rules file, then reloads ufw.")
+    reload_parser = subparsers.add_parser("reload", help=f"Removes and re-adds all {PROGRAM_NAME}-added rules from/to iptables/ip6tables.")
     reload_parser.set_defaults(func=reload_func)
 
-    reset_parser = subparsers.add_parser("reset", help="")
+    reset_parser = subparsers.add_parser("reset", help=f"Disables {PROGRAM_NAME}, resets all configuration values for {PROGRAM_NAME} to the default, and deletes all user-added rules.")
     reset_parser.set_defaults(func=reset_func)
 
-    status_parser = subparsers.add_parser("status", help=f"Prints all {PROGRAM_NAME}-added rules. Use {PROGRAM_NAME} status --help for more options.")
+    status_parser = subparsers.add_parser("status", help=f"shows firewall status. Use {PROGRAM_NAME} status --help for more options.")
     status_parser.set_defaults(func=status_func)
     status_parser_subparsers = status_parser.add_subparsers(dest="", required=False)
-    status_numbered_parser = status_parser_subparsers.add_parser("numbered", help=f"Prints all {PROGRAM_NAME}-added rules as a numbered list.")
+    status_numbered_parser = status_parser_subparsers.add_parser("numbered", help=f"shows firewall status as a numbered list.")
     status_numbered_parser.set_defaults(func=status_numbered_func)
-    status_verbose_parser = status_parser_subparsers.add_parser("verbose", help=f"Prints all {PROGRAM_NAME}-added rules with additional details.")
+    status_verbose_parser = status_parser_subparsers.add_parser("verbose", help=f"shows firewall status with additional details.")
     status_verbose_parser.set_defaults(func=status_verbose_func)
 
     show_parser = subparsers.add_parser("show", help="")
@@ -1379,18 +1795,11 @@ def configure_parser() -> argparse.ArgumentParser:
 
     return parser
 
-def docker_user_chain_exists():
-    try:
-        result = subprocess.run(["iptables", "-L", "DOCKER-USER", "-n"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return result.returncode == 0
-    except FileNotFoundError:
-        return False
-
 def confirm_root_and_chain() -> int:
     if os.geteuid() != 0:
         log("You need to be root to run this script", level=CRITICAL)
         return NOT_ROOT
-    if not docker_user_chain_exists():
+    if not chain_exists(CHAIN):
         log(f"The {CHAIN} chain does not exist in iptables, the iptables command doesn't exist, or you don't have permission to use iptables. Ensure iptables and docker are correctly configured on your system.", level=CRITICAL)
         return IPTABLES_ERROR
     return 0
@@ -1420,7 +1829,8 @@ def main():
         sys.exit(CONFIG_INVALID)
     if not os.path.exists(DFW_RULES_PATH):
         log(f"{DFW_RULES_PATH} doesn't exist. Creating default rules file.", level=WARNING)
-        make_fresh_rules_file(args.config.default_in, args.config.default_out)
+        make_fresh_rules_file(args.config)
+    # TODO consider putting rules on args and passing that around instead of reading it multiple times.
     sys.exit(args.func(args, remainder))
 
 if __name__ == "__main__":
