@@ -27,7 +27,7 @@ import sys
 from typing import Self
 
 PROGRAM_NAME="dfw"
-VERSION="0.0.7"
+VERSION="0.0.8"
 
 TRACE=5
 DEBUG=10
@@ -54,13 +54,12 @@ CONFIG_INVALID=3
 RULE_INVALID=4
 IPTABLES_ERROR=5
 CONFIRMATION_DENIED=6
-FEATURE_INCOMPLETE=7
-INTERNAL_ERROR=8
-NONEXISTANT_RULE=9
-RULE_ALREADY_EXISTS=10
-INVALID_COMMAND=11
-IPV6_DISABLED=12
-BAD_CONTROL=13
+NONEXISTANT_RULE=7
+RULE_ALREADY_EXISTS=8
+INVALID_COMMAND=9
+IPV6_DISABLED=10
+BAD_CONTROL=11
+# INTERNAL_ERROR=12
 
 DEFAULT_IFACE="eth0" # This is set at program startup, so this value is just a fallback
 
@@ -234,8 +233,6 @@ class Config:
             for key in check_configs:
                 log(f"Required configuration missing: {key[:-2]}", level=CRITICAL)
             raise ValueError(f"Invalid configuration file: {DFW_CONFIG_PATH}")
-        if "reject" in (new_config.default_in,new_config.default_out):
-            raise ValueError(f"{PROGRAM_NAME} does not currently support \"reject\"") # TODO NOW
         return new_config
 
     def print_updated_config(self) -> str:
@@ -1013,30 +1010,30 @@ def read_config() -> str: # guaranteed to exist by start of main func
 
 def make_default_rules(default_in: str, default_out: str, logging_level: str, ipv6_subnet="") -> (list[str],list[str]):
     # Log level low (all with rate limiting):
-        # deny in | allow out:
-            # (A) incoming and outgoing packets matched by log-ed rules, and (B) packets that are being dropped due to the deny-in policy. Allow-ed packets are only logged if they match the first criteria (match a log-ed rule)
+        # deny/reject in | allow out:
+            # (A) incoming and outgoing packets matched by log-ed rules, and (B) packets that are being dropped/rejected due to the deny/reject-in policy. Allow-ed packets are only logged if they match the first criteria (match a log-ed rule)
                 ## (A) is achieved in print_rule_ipt
-                ## (B) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL -j DROP. That rule represents the default policy of deny incoming. The criteria of the jump must match the criteria of the subsequent DROP rule.
-        # deny in | deny out:
-            # (A) incoming and outgoing packets matched by log-ed rules, and (B) packets that are being dropped due to the deny-in or deny-out policies. Allow-ed packets are only logged if they match the first criteria (match a log-ed rule)
+                ## (B) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL -j DROP (or REJECT). That rule represents the default policy of deny/reject incoming. The criteria of the jump must match the criteria of the subsequent DROP/REJECT rule.
+        # deny/reject in | deny/reject out:
+            # (A) incoming and outgoing packets matched by log-ed rules, and (B) packets that are being dropped/rejected due to the deny/reject-in or deny/reject-out policies. Allow-ed packets are only logged if they match the first criteria (match a log-ed rule)
                 ## (A) is achieved in print_rule_ipt
-                ## (B) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL -j DROP; and putting a jump to DFW-LOG-DENY immediately before the rule: -A DOCKER-USER -s 172.17.0.0/12 -m conntrack --ctdir ORIGINAL -j DROP. Those rules represent the default policies of deny incoming and deny outgoing. The criteria of the jumps must match the criteria of their respective subsequent DROP rules.
+                ## (B) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL -j DROP (or REJECT); and putting a jump to DFW-LOG-DENY immediately before the rule: -A DOCKER-USER -s 172.17.0.0/12 -m conntrack --ctdir ORIGINAL -j DROP (or REJECT). Those rules represent the default policies of deny/reject incoming and deny/reject outgoing. The criteria of the jumps must match the criteria of their respective subsequent DROP/REJECT rules.
         # allow in | allow out:
-            # (A) incoming and outgoing packets matched by log-ed rules. No packets are dropped due to default policy
+            # (A) incoming and outgoing packets matched by log-ed rules. No packets are dropped/rejected due to default policy
                 ## (A) is achieved in print_rule_ipt
-        # allow in | deny out:
-            # (A) incoming and outgoing packets matched by log-ed rules, and (B) packets that being dropped due to the deny-out policy. Allow-ed packets are only logged if they match the first criteria (match a log-ed rule)
+        # allow in | deny/reject out:
+            # (A) incoming and outgoing packets matched by log-ed rules, and (B) packets that being dropped/rejected due to the deny/reject-out policy. Allow-ed packets are only logged if they match the first criteria (match a log-ed rule)
                 ## (A) is achieved in print_rule_ipt
-                ## (B) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -s 172.17.0.0/12 -m conntrack --ctdir ORIGINAL -j DROP. That rule represents the default policy of deny outgoing. The criteria of the jump must match the criteria of the subsequent DROP rule.
+                ## (B) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -s 172.17.0.0/12 -m conntrack --ctdir ORIGINAL -j DROP (or REJECT). That rule represents the default policy of deny/reject outgoing. The criteria of the jump must match the criteria of the subsequent DROP/REJECT rule.
     # Log level medium (all with rate limiting):
-        # deny in | allow out:
-            # (A) incoming and outgoing packets matched by log-ed rules, (B) incoming packets that are being dropped only due to the deny-in policy,
+        # deny/reject in | allow out:
+            # (A) incoming and outgoing packets matched by log-ed rules, (B) incoming packets that are being dropped/rejected only due to the deny/reject-in policy,
             # (C) incoming and outgoing packets that are NEW or INVALID, and (D) outgoing packets that are only allow-ed due to the allow-out policy (practical note, medium never logs established/related packets due to D).
                 ## (A) and (B) refer to low rules for this default policy set.
                 ## (C) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -m conntrack --ctstate INVALID -j DROP, and putting a jump to the DFW-LOG-ALLOW chain immediately before the rule: -A DOCKER-USER -s 172.17.0.0/12 -m conntrack --ctdir ORIGINAL -j RETURN (i.e. default policy allow out). The criteria of the jump to the DFW-LOG-DENY must match the criteria of the subsequent DROP rule. The criteria of the jump to the DFW-LOG-ALLOW chain must match the criteria of the subsequent RETURN rule and require ctstate to be NEW.
                 ## (D) is achieved implicitly by (C)
-        # deny in | deny out:
-            # (A) incoming and outgoing packets matched by log-ed rules, (B) incoming and outgoing packets that are being dropped only due to the deny-in and deny-out policies, and
+        # deny/reject in | deny/reject out:
+            # (A) incoming and outgoing packets matched by log-ed rules, (B) incoming and outgoing packets that are being dropped only due to the deny/reject-in and deny/reject-out policies, and
             # (C) incoming and outgoing packets that are NEW or INVALID.
                 ## (A) and (B) refer to low rules for this default policy set.
                 ## (C) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -m conntrack --ctstate INVALID -j DROP. The criteria of the jump to the DFW-LOG-DENY must match the criteria of the subsequent DROP rule.
@@ -1046,8 +1043,8 @@ def make_default_rules(default_in: str, default_out: str, logging_level: str, ip
                 ## (A) refer to low rules for this default policy set.
                 ## (C) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -m conntrack --ctstate INVALID -j DROP, putting a jump to the DFW-LOG-ALLOW chain immediately before the rule: -A DOCKER-USER -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL -j RETURN (i.e. default policy allow in), and putting a jump to the DFW-LOG-ALLOW chain immediately before the rule: -A DOCKER-USER -s 172.17.0.0/12 -m conntrack --ctdir ORIGINAL -j RETURN (i.e. default policy allow out). The criteria of the jump to DFW-LOG-DENY must match the criteria of the subsequent DROP rule. The criteria of the jumps to the DFW-LOG-ALLOW chain must match the criteria of the respective subsequent RETURN rules and require ctstate for both log rules to be NEW.
                 ## (D) is achieved implicitly by (C)
-        # allow in | deny out:
-            # (A) incoming and outgoing packets matched by log-ed rules, (B) outgoing packets that are only deny-ed due to the deny-out policy,
+        # allow in | deny/reject out:
+            # (A) incoming and outgoing packets matched by log-ed rules, (B) outgoing packets that are only dropped/rejected due to the deny/reject-out policy,
             # (C) incoming and outgoing packets that are NEW or INVALID, and (D) incoming packets that are being allow-ed only due to the allow-in policy.
                 ## (A) and (B) refer to low rules for this default policy set.
                 ## (C) is achieved by putting a jump to the DFW-LOG-DENY chain immediately before the rule: -A DOCKER-USER -m conntrack --ctstate INVALID -j DROP, and putting a jump to the DFW-LOG-ALLOW chain immediately before the rule: -A DOCKER-USER -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL -j RETURN (i.e. default policy allow in). The criteria of the jump to the DFW-LOG-DENY must match the criteria of the subsequent DROP rule. The criteria of the jump to the DFW-LOG-ALLOW chain must match the criteria of the subsequent RETURN rule and require ctstate to be NEW.
@@ -1064,11 +1061,11 @@ def make_default_rules(default_in: str, default_out: str, logging_level: str, ip
         top_rules.insert(1, f"-A {LOG_CHAIN_DENY} -j LOG --log-prefix {LOG_PREFIX_BLOCK} --log-level 4 {RULE_COMMENT}")
         top_rules.insert(0, f"-N {LOG_CHAIN_ALLOW} {RULE_COMMENT}")
         top_rules.insert(1, f"-A {LOG_CHAIN_ALLOW} -j LOG --log-prefix {LOG_PREFIX_ALLOW} --log-level 4 {RULE_COMMENT}")
-        if default_in == "deny": # TODO NOW: add reject support
-            bottom_rules.append(f"-A {CHAIN} -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL{' -m limit --limit 3/min --limit-burst 10' if logging_level in ('low','medium') else ''} -j {LOG_CHAIN_DENY} {RULE_COMMENT}") # log packets denied due to the default deny-in policy
-        if default_out == "deny": # TODO NOW: add reject support
+        if default_in in ("deny", "reject"):
+            bottom_rules.append(f"-A {CHAIN} -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL{' -m limit --limit 3/min --limit-burst 10' if logging_level in ('low','medium') else ''} -j {LOG_CHAIN_DENY} {RULE_COMMENT}") # log packets denied due to the default deny/reject-in policy
+        if default_out in ("deny","reject"):
             bottom_rules.append(f"-A {CHAIN} -s {'172.17.0.0/12' if not ipv6_subnet else ipv6_subnet} -m conntrack --ctdir ORIGINAL{' -m limit --limit 3/min --limit-burst 10' if logging_level in ('low','medium') else ''} -j {LOG_CHAIN_DENY} {RULE_COMMENT}") # log packets denied due to the default deny-out policy
-            bottom_rules.append(f"-A {CHAIN} -o docker0 -m conntrack --ctdir ORIGINAL{' -m limit --limit 3/min --limit-burst 10' if logging_level in ('low','medium') else ''} -j {LOG_CHAIN_DENY} {RULE_COMMENT}") # log packets denied due to the default deny-out policy
+            bottom_rules.append(f"-A {CHAIN} -o docker0 -m conntrack --ctdir ORIGINAL{' -m limit --limit 3/min --limit-burst 10' if logging_level in ('low','medium') else ''} -j {LOG_CHAIN_DENY} {RULE_COMMENT}") # log packets denied due to the default deny/reject-out policy
     if logging_level in ("medium", "high", "full"): # add "medium" logs
         # At this point top_rules is: (0) CREATE_LOG_ALLOW_CHAIN, (1) POPULATE_LOG_ALLOW_CHAIN, (2) CREATE_LOG_DENY_CHAIN, (3) POPULATE_LOG_DENY_CHAIN (4) DROP_INVALID, (5) RETURN_ESTABLISH/RELATED
         top_rules.insert(4, f"-A {CHAIN} -m conntrack --ctstate INVALID{' -m limit --limit 3/min --limit-burst 10' if logging_level=='medium' else ''} -j {LOG_CHAIN_DENY} {RULE_COMMENT}") # log invalid packets (which are denied)
@@ -1082,16 +1079,16 @@ def make_default_rules(default_in: str, default_out: str, logging_level: str, ip
         pass # TODO LATER: log packets that have triggered rate limiting
     if logging_level == "full":
         top_rules.insert(4, f"-A {CHAIN} -m conntrack --ctstate ESTABLISHED,RELATED -j {LOG_CHAIN_ALLOW} {RULE_COMMENT}")
-    if default_in == "deny": # TODO NOW: add reject support
-        bottom_rules.append(f"-A {CHAIN} -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL -j DROP {RULE_COMMENT}") # deny anything in that is incoming on the default interface
+    if default_in in ("deny","reject"):
+        bottom_rules.append(f"-A {CHAIN} -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL -j {'DROP' if default_in=='deny' else 'REJECT'} {RULE_COMMENT}") # deny anything in that is incoming on the default interface
     else: # default_in == "allow"
         bottom_rules.append(f"-A {CHAIN} -i {DEFAULT_IFACE} -m conntrack --ctdir ORIGINAL -j RETURN {RULE_COMMENT}") # allow anything in that is incoming on the default interface
-    if default_out == "allow": # TODO NOW: add reject support
+    if default_out == "allow":
         bottom_rules.append(f"-A {CHAIN} -s {'172.17.0.0/12' if not ipv6_subnet else ipv6_subnet} -m conntrack --ctdir ORIGINAL -j RETURN {RULE_COMMENT}") # allow out anything originating from the default docker address range
         bottom_rules.append(f"-A {CHAIN} -o docker0 -m conntrack --ctdir ORIGINAL -j RETURN {RULE_COMMENT}") # allow out anything originating from the default docker address range
     else: # default_out == "deny"
-        bottom_rules.append(f"-A {CHAIN} -s {'172.17.0.0/12' if not ipv6_subnet else ipv6_subnet} -m conntrack --ctdir ORIGINAL -j DROP {RULE_COMMENT}") # deny anything originating from the default docker address range
-        bottom_rules.append(f"-A {CHAIN} -o docker0 -m conntrack --ctdir ORIGINAL -j DROP {RULE_COMMENT}") # deny anything originating from the default docker address range
+        bottom_rules.append(f"-A {CHAIN} -s {'172.17.0.0/12' if not ipv6_subnet else ipv6_subnet} -m conntrack --ctdir ORIGINAL -j {'DROP' if default_out=='deny' else 'REJECT'} {RULE_COMMENT}") # deny anything originating from the default docker address range
+        bottom_rules.append(f"-A {CHAIN} -o docker0 -m conntrack --ctdir ORIGINAL -j {'DROP' if default_out=='deny' else 'REJECT'} {RULE_COMMENT}") # deny anything originating from the default docker address range
     # security: drop anything that makes it past the above handling, just to be safe...
     if logging_level in ("low","medium","high","full"):
         bottom_rules.append(f"-A {CHAIN}{' -m limit --limit 3/min --limit-burst 10' if logging_level in ('low','medium') else ''} -j {LOG_CHAIN_DENY}")
@@ -1370,17 +1367,17 @@ def push_rules_to_iptables(conf: Config) -> int:
         log("Pushed rules to ip6tables", level=DEBUG)
     return 0
 
-def generate_statuses(numbered: bool, verbose: bool, ipv6_enabled:bool, logging_level="", default_in="", default_out="") -> str:
+def generate_statuses(numbered: bool, verbose: bool, ipv6_enabled:bool, logging_level="", default_in="", default_out="") -> (str,int):
     rules_str_list,err_code = read_rules_file()
     if err_code != 0:
-        return err_code
+        return "",err_code
     rules = []
     for rule_str in rules_str_list:
         try:
             rule = Rule.parse_rule_form(rule_str)
         except ValueError as e:
             log(f"ERROR: {e} in {DFW_RULES_PATH}", level=ERROR)
-            return "","",RULE_INVALID
+            return "",RULE_INVALID
         rules.append(rule)
     if numbered == True:
         statuses = [[str(index+1), *rule.to_status(True)] for index,rule in enumerate(rules) if rule.ipv_type in ("4", "both")]
@@ -1425,7 +1422,7 @@ def generate_statuses(numbered: bool, verbose: bool, ipv6_enabled:bool, logging_
     content += dash_line
     for status_parts in padded_statuses:
         content += f"{status_parts[0]}{' '*sep}{status_parts[1]}{' '*sep}{status_parts[2]}\n"
-    return content
+    return content,0
 
 def enable_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     log(f"{args=}", level=TRACE)
@@ -1461,15 +1458,15 @@ def disable_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
             return err_code
         if (err_code := flush_chain(CHAIN)):
             return err_code
+        if chain_exists(CHAIN, "6"):
+            if (err_code := flush_chain(CHAIN, "6")):
+                return err_code
         for chain in (LOG_CHAIN_ALLOW, LOG_CHAIN_DENY):
             if chain_exists(chain):
                 if (err_code := flush_chain(chain)):
                     return err_code
                 if (err_code := delete_chain(chain)):
                     return err_code
-        if (err_code := flush_chain(CHAIN, "6")):
-            return err_code
-        for chain in (LOG_CHAIN_ALLOW, LOG_CHAIN_DENY):
             if chain_exists(chain, "6"):
                 if (err_code := flush_chain(chain, "6")):
                     return err_code
@@ -1479,19 +1476,11 @@ def disable_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     return 0
 
 def default_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
-    # default allow|deny|reject DIRECTION
-    #        change the default policy for traffic going DIRECTION, where DIRECTION is one of incoming or outgoing. Note
-    #        that existing rules will have to be migrated manually when changing the default policy. See RULE SYNTAX for more on
-    #        deny and reject.
     log(f"{args=}", level=TRACE)
     if len(remainder) != 2 or remainder[0] not in ("allow", "deny", "reject") or remainder[1] not in ("incoming", "outgoing"):
         log("ERROR: Invalid Syntax", level=ERROR)
         print(args.help_text)
         return INVALID_COMMAND
-    if remainder[0] == "reject":
-        # TODO NOW support reject
-        log(f"{PROGRAM_NAME} does not currently support \"reject\"", level=CRITICAL)
-        return FEATURE_INCOMPLETE
     if remainder[1] == "incoming":
         args.config.default_in = remainder[0]
     else:
@@ -1545,10 +1534,8 @@ def logging_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
 
 def rule_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     # Example of limit
-    # :DOCKER-USER - [0:0]
     # -A DOCKER-USER -p tcp -m conntrack --ctorigdstport 8080 --ctstate NEW -m recent --set --name PORT8080
     # -A DOCKER-USER -p tcp -m conntrack --ctorigdstport 8080 --ctstate NEW -m recent --update --seconds 30 --hitcount 6 --name PORT8080 -j DROP
-    # -A DOCKER-USER -j RETURN
     log(f"{args=}", level=TRACE)
     log(f"command and remainder are: {args.command}, {' '.join(remainder)}", level=TRACE)
     try:
@@ -1567,12 +1554,12 @@ def rule_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
         if rule.ipv_type == "6" and args.config.ipv6_subnet == "Disabled":
             log(f"IPv6 functionality is disabled in {DFW_CONFIG_PATH}. No changes made", level=ERROR)
             return IPV6_DISABLED
-        if rule != Rule.parse_rule_form(rule.print_rule_form()):
-            log(f"{rule.__dict__=}\nvs\n{Rule.parse_rule_form(rule.print_rule_form()).__dict__=}", level=DEBUG)
-            log("ERROR: Internal consistency check failed!", level=ERROR)
-            return INTERNAL_ERROR
+        # if rule != Rule.parse_rule_form(rule.print_rule_form()):
+        #     log(f"{rule.__dict__=}\nvs\n{Rule.parse_rule_form(rule.print_rule_form()).__dict__=}", level=DEBUG)
+        #     log("ERROR: Internal consistency check failed!", level=ERROR)
+        #     return INTERNAL_ERROR
         if rule.action and not args.dry_run:
-            log(f"{rule.print_rule_ipt(logging_level=args.config.logging_level)}", level=TRACE)
+            log(rule.print_rule_ipt(logging_level=args.config.logging_level), level=TRACE)
     if not args.dry_run:
         if err_code := (confirm_root_and_chain() or write_rules_file(new_rules,summary)):
             return err_code
@@ -1609,8 +1596,9 @@ def reset_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
         write_config(Config.default_config)
         if (err_code := flush_chain(CHAIN)):
             return err_code
-        if (err_code := flush_chain(CHAIN, "6")):
-            return err_code
+        if chain_exists(CHAIN, "6"):
+            if (err_code := flush_chain(CHAIN, "6")):
+                return err_code
         for chain in (LOG_CHAIN_ALLOW, LOG_CHAIN_DENY):
             if chain_exists(chain):
                 if (err_code := flush_chain(chain)):
@@ -1634,7 +1622,9 @@ def status_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     if not args.config.enabled:
         print(f"Status: inactive")
         return 0
-    content = generate_statuses(False, False, args.config.ipv6_subnet!="Disabled")
+    content,err_code = generate_statuses(False, False, args.config.ipv6_subnet!="Disabled")
+    if err_code:
+        return err_code
     print(content)
     return 0
 
@@ -1645,7 +1635,9 @@ def status_numbered_func(args: argparse.Namespace, remainder: tuple[str]) -> int
     if not args.config.enabled:
         print(f"Status: inactive")
         return 0
-    content = generate_statuses(True, False, args.config.ipv6_subnet!="Disabled")
+    content,err_code = generate_statuses(True, False, args.config.ipv6_subnet!="Disabled")
+    if err_code:
+        return err_code
     print(content)
     return 0
 
@@ -1656,7 +1648,9 @@ def status_verbose_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
     if not args.config.enabled:
         print(f"Status: inactive")
         return 0
-    content = generate_statuses(False, True, args.config.ipv6_subnet!="Disabled", args.config.logging_level, args.config.default_in, args.config.default_out)
+    content,err_code = generate_statuses(False, True, args.config.ipv6_subnet!="Disabled", args.config.logging_level, args.config.default_in, args.config.default_out)
+    if err_code:
+        return err_code
     print(content)
     return 0
 
@@ -1740,19 +1734,19 @@ def configure_parser() -> argparse.ArgumentParser:
     rule_parser = subparsers.add_parser("rule", help=f"Add a rule")
     rule_parser.set_defaults(func=rule_func)
 
-    allow_parser = subparsers.add_parser("allow", help=f"Adds an allow rule")
+    allow_parser = subparsers.add_parser("allow", help=f"Add an allow rule")
     allow_parser.set_defaults(func=rule_func)
 
-    deny_parser = subparsers.add_parser("deny", help="Adds a deny rule")
+    deny_parser = subparsers.add_parser("deny", help="Add a deny rule")
     deny_parser.set_defaults(func=rule_func)
 
-    reject_parser = subparsers.add_parser("reject", help="Adds a reject rule")
+    reject_parser = subparsers.add_parser("reject", help="Add a reject rule")
     reject_parser.set_defaults(func=rule_func)
 
-    limit_parser = subparsers.add_parser("limit", help="Adds a limit rule")
+    limit_parser = subparsers.add_parser("limit", help="Add a limit rule")
     limit_parser.set_defaults(func=rule_func)
 
-    delete_parser = subparsers.add_parser("delete", help="Deletes the specified rule")
+    delete_parser = subparsers.add_parser("delete", help="Delete the specified rule")
     delete_parser.set_defaults(func=rule_func)
 
     insert_parser = subparsers.add_parser("insert", help="Insert a rule as the given index")
@@ -1788,7 +1782,7 @@ def confirm_root_and_chain() -> int:
         log("You need to be root to run this script", level=CRITICAL)
         return NOT_ROOT
     if not chain_exists(CHAIN):
-        log(f"The {CHAIN} chain does not exist in iptables, the iptables command doesn't exist, or you don't have permission to use iptables. Ensure iptables and docker are correctly configured on your system.", level=CRITICAL)
+        log(f"ERROR: docker isn't enabled, the {CHAIN} chain does not exist in iptables, the iptables command doesn't exist, or you don't have permission to use iptables. Ensure docker and iptables are enabled and correctly configured on your system.", level=CRITICAL)
         return IPTABLES_ERROR
     return 0
 
@@ -1797,16 +1791,15 @@ def shutdown() -> int:
         return err_code
     if (err_code := flush_chain(CHAIN)):
         return err_code
+    if chain_exists(CHAIN, "6"):
+        if (err_code := flush_chain(CHAIN, "6")):
+            return err_code
     for chain in (LOG_CHAIN_ALLOW, LOG_CHAIN_DENY):
         if chain_exists(chain):
             if (err_code := flush_chain(chain)):
                 return err_code
             if (err_code := delete_chain(chain)):
                 return err_code
-    if chain_exists(CHAIN, "6"):
-        if (err_code := flush_chain(CHAIN, "6")):
-            return err_code
-    for chain in (LOG_CHAIN_ALLOW, LOG_CHAIN_DENY):
         if chain_exists(chain, "6"):
             if (err_code := flush_chain(chain, "6")):
                 return err_code
