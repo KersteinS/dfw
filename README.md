@@ -7,4 +7,5 @@ Quirks:
 1. In order for the DOCKER-USER chain to catch traffic an input or output interface must be specified for every rule. The default interface to the internet will be provisioned for rules that don't specify what interface they should be "on". 
 2. Related to the above, the concept of route rules from UFW doesn't really apply in DFW, so route syntax is not supported. 
 3. Comma separated port ranges are not currently supported. Support is planned in the future.
-4. Although it is functional, this program is still a work-in-progress and bugs or other errors likely exist.
+4. Application support similar to UFW's functionality is planned, but not yet implemented.
+5. Although it is functional, this program is still a work-in-progress and bugs or other errors likely exist.
