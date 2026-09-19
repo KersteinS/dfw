@@ -18,31 +18,34 @@ import argparse
 import ipaddress
 import os
 import shutil
+import subprocess
 import sys
 
 PROGRAM_NAME="dfw"
-VERSION="0.0.1"
+VERSION="0.0.2"
 TRACE=5
 DEBUG=10
 INFO=20
 WARNING=30
 ERROR=40
 CRITICAL=50
-CONFIG_PATH="./etc/dfw/dfw.conf"
-UFW_RULES_PATH="./etc/ufw/after.rules"
-START_COMMENT=f"# START {PROGRAM_NAME} CHANGES.\n"
-END_COMMENT=f"# END {PROGRAM_NAME} CHANGES.\n"
+# CONFIG_PATH="./etc/dfw/dfw.conf"
+DFW_RULES_PATH="./etc/dfw/dfw.rules"
+# START_COMMENT=f"# START {PROGRAM_NAME} CHANGES.\n"
+# END_COMMENT=f"# END {PROGRAM_NAME} CHANGES.\n"
+RULE_COMMENT=f"{PROGRAM_NAME} ADDED RULE"
 NOT_ROOT=1
 FILE_MISSING=2
 MISSING_MALFORMED_EDITS=3
 MISSING_MALFORMED_BLOCK=4
 CONFIG_EMPTY=5
 CONFIG_INVALID=6
+IPTABLES_ERROR=7
 
 # -A DOCKER-USER -m conntrack --ctorigdstport 8080 -p tcp -j DROP
 # To flush all DOCKER-USER chain rules: sudo iptables -F DOCKER-USER
 # To list all DOCKER-USER chain rules: sudo iptables -L DOCKER-USER -n -v
-# Goals: Script that accepts ufw-like syntax to add rules to ufw's after.rules file. This allows rules to load before docker's rules in iptables, (but still after docker's NAT changes the dest port to the container port but I work aroudn that)  effectively enabling firewall for docker using the host ports rather than the destination port (which is the other popular solution). Script should accept as many ufw-like commands as possible and support similar options when possible.
+# Goals: Script that accepts ufw-like syntax to add rules to iptables in the DOCKER-USER chain. Script is sole manager of DOCKER-USER chain. This allows rules to load before docker's default rules in iptables, (but still after docker's NAT changes the dest port to the container port but I work aroudn that)  effectively enabling firewall for docker using the host ports rather than the destination port (which is the other popular solution). Script should accept as many ufw-like commands as possible and support similar options when possible.
 # Commands to support:
 # enable                          enables the firewall
 # disable                         disables the firewall
@@ -55,9 +58,9 @@ CONFIG_INVALID=6
 # delete RULE|NUM                 delete RULE
 # insert NUM RULE                 insert RULE at NUM
 # prepend RULE                    prepend RULE
-# route RULE                      add route RULE
-# route delete RULE|NUM           delete route RULE
-# route insert NUM RULE           insert route RULE at NUM
+# route RULE                      add route RULE # route is not supported since the only chain managed by dfw is DOCKER-USER. THere is no other traffic besides traffinc being routed to DOCKER-USER
+# route delete RULE|NUM           delete route RULE # route is not supported since the only chain managed by dfw is DOCKER-USER. THere is no other traffic besides traffinc being routed to DOCKER-USER
+# route insert NUM RULE           insert route RULE at NUM # route is not supported since the only chain managed by dfw is DOCKER-USER. THere is no other traffic besides traffinc being routed to DOCKER-USER
 # reload                          reload firewall
 # reset                           reset firewall
 # status                          show firewall status
@@ -66,10 +69,62 @@ CONFIG_INVALID=6
 # show ARG                        show firewall report
 # version                         display version information
 
-
 class Rule:
-    def __init__(*args, **kwargs):
+    # TODO All rules need DFW_COMMENT: sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT -m comment --comment "DFW ADDED RULE"
+    def __init__(self, *args, **kwargs):
         log(args, kwargs, level=DEBUG)
+        self.rule_text = args[0]
+        self.command_text = args[1]
+    # note: any is a wildcard that represents all possible addresses (0.0.0.0/0 for IPv4 and ::/0 for IPv6)
+    # note: rules will be made for IPv4 and IPv6 unless an address (or range of addresses) is provided that matches only either IPv4 or IPv6.
+    # note: app entries use ini-syntax like:
+    #    [SomeService]
+    #    title=Some title
+    #    description=Some description
+    #    ports=12/udp|34|56,78:90/tcp
+    # members for simple syntax:
+    # verb = allow|deny|reject|limit (required)
+    # direction = in|out (optional, default in
+    # log =  log|log-all (optional, if not provided, no specific logging for this rule is enabled. Note that global logging rules are applied seperately)
+    # port_and_proto = [ PORT[/PROTOCOL] | APPNAME ] (port at least is required, proto is optional and if not provided will allow both tcp and udp. Alternatively, an app name can be provided. If ufw is installed, dfw will use ufw's app definitions, otherwise, it will fallback to a dfw app definitions file)
+    # comment = a string comment (optional, unused if not provided. Length is limited to 256 - len(RULE_COMMENT)-1 and will be prepended with RULE_COMMENT)
+
+    # members for advanced syntax:
+    # verb
+    # direction 
+    # interface = valid network interface on system (ls /sys/class/net/ must be defined after direction and prefix with "on" keyword)
+    # log
+    # protocol = tcp|udp (optional, will be create a rule for both tcp and udp if ommitted)
+    # from_address = ip address to [verb] (optional, must be prepended by "from" keyword if used)
+    # from_port (port provided with from_address, can be substituted with an app name)
+    # to_address = ip address to [verb] (optional, must be provided by "to" keyword if used)
+    # to_port (port provided with to_address, can be substited with the "app" keyword and an app name)
+    # app = app APPNAME (can be used instead of "port" keyword and a port)
+    # comment
+
+    @classmethod
+    def read(cls, line: str):
+        # This takes an iptre script line and parses it into a Rule instance
+        return cls(line, "")
+    
+    @classmethod
+    def interpret(cls, command: str):
+        # This takes a dfw command (e.g. dfw allow 8080) and parses it into a Rule instance
+        return cls("", command)
+
+    def print_rule(self):
+        pass
+
+    def push(self) -> int:
+        # This makes sends the Rule to iptables.
+        cmd = ["iptables"] # need to construct the command based on defined members created in interpret or read
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return result.returncode
+        except subprocess.CalledProcessError as e:
+            log(f"Command failed: {' '.join(cmd)}\nError: {e.stderr}", CRITICAL)
+            return IPTABLES_ERROR
+            
 
 def get_version_string() -> str:
     return f"{PROGRAM_NAME} version {VERSION}"
@@ -91,7 +146,7 @@ def read_config() -> str:
         write_config("")
         return ""
 
-def is_valid(config: str) -> bool:
+def is_config_valid(config: str) -> bool:
     # TODO
     # store states at the top of the config as comments. Like log enabled state and level.
     # LOG: True|False
@@ -100,115 +155,62 @@ def is_valid(config: str) -> bool:
 
 def read_rules_file() -> (list[str], int):
     try:
-        with open(UFW_RULES_PATH, "r") as rules_file:
+        with open(DFW_RULES_PATH, "r") as rules_file:
             rules_list = rules_file.readlines()
         log("Read rules file successfully", level=TRACE)
         return rules_list, 0
     except FileNotFoundError:
-        log(f"Reading {UFW_RULES_PATH} failed due to missing file. Aborting!", level=CRITICAL)
+        log(f"Reading {DFW_RULES_PATH} failed due to missing file. Aborting!", level=CRITICAL)
         return [], FILE_MISSING
 
 def write_rules_file(content: list[str]) -> int:
     try:
-        shutil.copy2(UFW_RULES_PATH, UFW_RULES_PATH+".bak")
-        log("Made backup of after.rules.", level=INFO)
-        if not os.path.exists(UFW_RULES_PATH+".original"):
-                shutil.copy2(UFW_RULES_PATH, UFW_RULES_PATH+".original")
+        shutil.copy2(DFW_RULES_PATH, DFW_RULES_PATH+".bak")
+        log("Made backup of dfw.rules.", level=INFO)
+        if not os.path.exists(DFW_RULES_PATH+".original"):
+                shutil.copy2(DFW_RULES_PATH, DFW_RULES_PATH+".original")
                 log("Made backup of original after.rules", INFO)
                 return 0
     except FileNotFoundError:
-        log(f"Couldn't back up {UFW_RULES_PATH} due to missing file. Aborting!", level=CRITICAL)
+        log(f"Couldn't back up {DFW_RULES_PATH} due to missing file. Aborting!", level=CRITICAL)
         return FILE_MISSING
     try:
-        with open(UFW_RULES_PATH, "w") as rules_file:
+        with open(DFW_RULES_PATH, "w") as rules_file:
             rules_file.writelines(content)
         log("Wrote to after.rules.", level=TRACE)
     except FileNotFoundError:
-        log(f"Couldn't write {UFW_RULES_PATH} due to missing file. Aborting!", level=CRITICAL)
+        log(f"Couldn't write {DFW_RULES_PATH} due to missing file. Aborting!", level=CRITICAL)
         return FILE_MISSING
 
-def get_start_end_indices(rules_list) -> (int, int):
-    try:
-        s_index = rules_list.index(START_COMMENT)
-        e_index = rules_list.index(END_COMMENT)
-        return s_index, e_index
-    except ValueError:
-        log(f"Couldn't locate a complete {PROGRAM_NAME} config block in after.rules. The file may not have any changes made by {PROGRAM_NAME} or it may be malformed.", level=WARNING)
-        return -1, -1
-
-def add_config_to_rules(config: str, is_dry: bool) -> int: # C - Create
-    if config == "":
-        log("config is empty. Nothing to write", level=WARNING)
-        return CONFIG_PATH
-    if not is_valid(config):
-        log("config has invalid syntax. Will not write.", level=WARNING)
-        return CONFIG_INVALID
-    rules_list, check = read_rules_file()
-    if check != 0:
-        return check
-    commit_index = -1
-    in_filter_block = False
-    for i, line in enumerate(rules_list):
-        stripped = line.strip()
-        if stripped.startswith("*filter"):
-            in_filter_block = True
-        if in_filter_block and stripped == "COMMIT":
-            commit_index = i
-            break
-    log(f"{commit_index=}", level=TRACE)
-    if commit_index == -1:
-        log(f"Couldn't locate a complete *filter block in {UFW_RULES_PATH}. Please ensure the file is set up correctly (incluing the COMMIT directive).", level=CRITICAL)
-        return MISSING_MALFORMED_BLOCK
-    target_index = -1
-    for i, line in enumerate(reversed(rules_list[:commit_index])):
-        stripped = line.strip()
-        if stripped.startswith("*filter"):
-            break # no longer in filter block. There is not blank line in between *filter and COMMIT, which is fine but needs to be accounted for.
-        if stripped == "":
-            target_index = commit_index - i
-            break
-    log(f"{target_index=}", level=TRACE)
-    if target_index == -1:
-        target_index = commit_index
-        log("Didn't find a blank line above the COMMIT line within the *filter block.", level=TRACE)
-    config = START_COMMENT + config + END_COMMENT
-    rules_list[target_index:target_index] = config
+# Rules file should not be in a format compatible with iptables-restore, as we don't want to flush the *filter table when loading. I also want to avoid using iptables-restore --no-flush for consistency reasons. I will manually add/remove individual rules using iptables directly.
+def create_rules(is_dry: bool) -> int: # C - Create
+    # make the rules file with baseline rules
+    # -I DOCKER-USER 1 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN # Allow containers to reach out
+    # -I DOCKER-USER 2 -i docker0 -j RETURN # allow docker-internal comms part 1 (by interface)
+    # -I DOCKER-USER 3 -s 172.17.0.0/12 -j RETURN # allow docker-internal comms part 2 (by subnet)
+    # -I DOCKER-USER 4 -j DROP # drop all other conns
+    # Note that this means custom docker interfaces (which users can use) will also be blocked/dropped. Need to add a config around that. Maybe they can just explicitly allow it. There is potentially a way to use dynamic docker network discovery using docker network inspect command?
     if not is_dry:
-        return write_rules_file(rules_list)
-    return 0
+        return write_rules_file([""])
 
-def read_config_from_rules() -> (str, int): # R - Read
+def read_rules() -> (list[Rule], int): # R - Read
+    # return a list of Rule instances. Rules read from rules file
     rules_list, check = read_rules_file()
     if check != 0:
         return "", check
-    start_index, end_index = get_start_end_indices(rules_list)
-    if start_index + end_index == -2:
-        return  "", MISSING_MALFORMED_EDITS
-    return "".join(rules_list[start_index:end_index+1]), 0
+    return [Rule.read(i) for i in rules_list], 0
 
-def update_config_in_rules(config: str, is_dry: bool) -> int: # U - Update
-    # INFORMATION: This is not a true update. It erases the contents of added rules section and writes new contents. So if the user makes manual changes to the added rules section then uses a func which utilizes this update function, those manual changes will be lost. I don't know how else to do it without a bunch of looping and best-guessing.
-    if config == "":
-        log("config is empty. Nothing to write", level=WARNING)
-        return CONFIG_EMPTY
-    if not is_valid(config):
-        log("config has invalid syntax. Will not write.", level=ERROR)
-        return CONFIG_INVALID
-    if start_index + end_index == -2:
-        return MISSING_MALFORMED_EDITS
-    rules_list, check = read_rules_file()
+def update_rules(command: str, is_dry: bool) -> int: # U - Update
+    # Add a rule to the rules file at the indicated index
+    current_rules, check = read_rules()
     if check != 0:
         return check
-    start_index, end_index = get_start_end_indices(rules_list)
-    if start_index + end_index == -2:
-        return MISSING_MALFORMED_EDITS
-    rules_list = rules_list[:start_index] + rules_list[end_index+1:]
-    rules_list[start_index:start_index] = config
+    current_rules.append(Rule.interpret(command))
     if not is_dry:
         return write_rules_file(rules_list)
     return 0
 
-def remove_config_from_rules(is_dry: bool) -> int: # D - Delete
+def remove_rule_from_rules(is_dry: bool) -> int: # D - Delete
     rules_list, check = read_rules_file()
     if check != 0:
         return check
@@ -221,20 +223,39 @@ def remove_config_from_rules(is_dry: bool) -> int: # D - Delete
     return 0
 
 def status_is_enabled() -> (bool, int):
-    rules_list, check = read_rules_file()
+    # This needs testing and refining. I want proper error handling if something is wrong in the command itself (using check=True) but I expect grep to return non-zero if dfw is disabled...
+    try:
+        result = subprocess.run(f"iptables -S | grep -- '{RULE_COMMENT}'", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return result.returncode == 0
+    except Exception as e:
+        print(f"Exception occurred: {e}")
+        return False, 1
+
+# I need to make sure that if docker restarts, this application detects that and re-applies the rules. docker restart flushes the DOCKER_USER chain, you see.
+def push_rules_to_iptables(is_dry) -> int:
+    # Gets the list of Rules, loops over them, checks if the rule is already added and adds it if not.
+    # Run this at the end of enable_func, allow_func, deny_func, etc. if not dry-run. If is_dry, run iptables-restore --test on the full rule set
+    # Must confirm rule doesn't exist already! This may be a challenge if iptables canonicalizes the rule differently than I store it in my rules file. Look at iptables -S
+    rules_list, check = read_rules()
     if check != 0:
-        return False, check
-    start_index, end_index = get_start_end_indices(rules_list)
-    if start_index + end_index == -2:
-        return False, 0
-    else:
-        return True, 0
+        return check
+    # TODO
+
+    return 0
+
+def remove_rule_from_iptables(rule: Rule) -> int:
+    # Receive a Rule instance, look for it in iptables, if present - remove it.
+    if Rule.rule_text
+    return 0
 
 def enable_func(args: argparse.Namespace) -> int:
     log(f"{args=}", level=DEBUG)
     log(f"{args.dry_run=}", level=INFO)
     log(f"{args.config=}", level=INFO)
-    return add_config_to_rules(args.config, args.dry_run)
+    if not args.dry_run:
+        return push_rules_to_iptables()
+    else:
+        return 0
 
 def disable_func(args: argparse.Namespace) -> int:
     log(f"{args=}", level=DEBUG)
@@ -462,6 +483,8 @@ def main():
 #    if os.geteuid() != 0:
 #        print(f"You need to be root to run this script")
 #        sys.exit(NOT_ROOT)
+
+    # TODO Must confirm DOCKER-USER table is present: if sudo iptables -L DOCKER-USER -n -v &>/dev/null; then echo TRUE; else echo FALSE; fi
     parser = configure_parser()
     args = parser.parse_args()
     global LOG_LEVEL
@@ -478,8 +501,8 @@ def main():
     else:
         LOG_LEVEL = WARNING
     log(*sys.argv, level=DEBUG)
-    if not os.path.exists(UFW_RULES_PATH):
-        log(f"{UFW_RULES_PATH} doesn't exist, cannot remove config from rules. Aborting!", level=CRITICAL)
+    if not os.path.exists(DFW_RULES_PATH):
+        log(f"{DFW_RULES_PATH} doesn't exist. Aborting!", level=CRITICAL) # Don't need to abort. I can just create it.
         sys.exit(FILE_MISSING)
     args.config = read_config()
     sys.exit(args.func(args))
