@@ -27,7 +27,7 @@ import sys
 from typing import Self
 
 PROGRAM_NAME="dfw"
-VERSION="0.0.8"
+VERSION="0.1.0"
 
 TRACE=5
 DEBUG=10
@@ -44,8 +44,10 @@ DFW_RULES_PATH="/etc/dfw/dfw.rules"
 CHAIN="DOCKER-USER"
 LOG_CHAIN_DENY=f"{PROGRAM_NAME.upper()}-LOG-DENY"
 LOG_CHAIN_ALLOW=f"{PROGRAM_NAME.upper()}-LOG-ALLOW"
+LOG_CHAIN_LIMIT=f"{PROGRAM_NAME.upper()}-LOG-LIMIT"
 LOG_PREFIX_BLOCK=f"{PROGRAM_NAME.upper()}-BLOCK:_"
 LOG_PREFIX_ALLOW=f"{PROGRAM_NAME.upper()}-ALLOW:_"
+LOG_PREFIX_LIMIT=f"{PROGRAM_NAME.upper()}-LIMIT:_"
 RULE_COMMENT=f"-m comment --comment {PROGRAM_NAME.upper()}_ADDED_RULE"
 
 NOT_ROOT=1
@@ -323,9 +325,10 @@ class Rule:
             to_str += " (v6)"
             from_str += " (v6)"
         if self.comment:
-            # TODO NOW: implement this as its own column in generate_statuses
-            from_str+=' '*7+"# "+from_base64(self.comment)
-        return (to_str, action_str, from_str)
+            comment_str = "# "+from_base64(self.comment)
+        else:
+            comment_str = ""
+        return (to_str, action_str, from_str, comment_str)
 
     @staticmethod
     def are_valid_ports(ports_str) -> bool:
@@ -742,10 +745,10 @@ class Rule:
                 raise ValueError("Must specify \"tcp\" or \"udp\" with multiple ports")
         if new_rule.sapp or new_rule.dapp:
             log(f"{new_rule.sapp=}, {new_rule.dapp=}", level=TRACE)
-            raise ValueError("Application Integration not currently supported") # TODO LATER
+            raise ValueError("Application Integration not currently supported") # TODO
         if any(i in (",") for i in new_rule.sports+new_rule.dports):
             log(f"Due to ctorigsrcport/ctorigdstport not supporting commas, {PROGRAM_NAME} doesn't support commas for port ranges yet. This is fixable, but no solution is implemented yet.", level=INFO)
-            raise ValueError(f"{PROGRAM_NAME} does not support commas in port ranges at this time") # TODO LATER
+            raise ValueError(f"{PROGRAM_NAME} does not support commas in port ranges at this time") # TODO NEXT
         return new_rule
 
     def print_rule_form(self) -> str:
@@ -871,7 +874,7 @@ class Rule:
             raise ValueError(errormsg)
         return new_rule
 
-    def print_rule_ipt(self, silent=False, logging_level="", ipv6=False) -> str:
+    def print_rule_ipt(self, silent=False, logging_level="", ipv4=True) -> str:
         # print the rule as iptables rule(s)
         interface_warm_msg = f"No {self.direction}put interface was provided (no \"on\" clause). Due to the implementation of the DOCKER-USER chain, the default interface to the internet ({DEFAULT_IFACE}) has been provisioned for this rule."
         rules = [f"-A {CHAIN} "]
@@ -900,12 +903,12 @@ class Rule:
             if "," not in self.sports:
                 rules[0] += f"--ctorigsrcport {self.sports} "
             else:
-                raise ValueError("ctorigsrcport does not support csv for port ranges, only ranges using colon (:)") # TODO LATER
+                raise ValueError("ctorigsrcport does not support csv for port ranges, only ranges using colon (:)") # TODO NEXT
         if self.dports:
             if "," not in self.dports:
                 rules[0] += f"--ctorigdstport {self.dports} "
             else:
-                raise ValueError("ctorigdstport does not support csv for port ranges, only ranges using colon (:)") #TODO LATER
+                raise ValueError("ctorigdstport does not support csv for port ranges, only ranges using colon (:)") #TODO NEXT
         if self.protocol == "both":
             rules.append(rules[0])
             rules[0] += "-p tcp "
@@ -918,16 +921,24 @@ class Rule:
             action = "-j DROP"
         elif self.action == "reject":
             action = "-j REJECT"
-        elif self.action == "limit":
-            raise ValueError("limit action not implemented yet") # TODO
-        for i in range(len(rules)):
-            rules[i] += f"{action} {RULE_COMMENT}"
-        if (self.log and logging_level != "off") or logging_level == "high":
+        if self.action != "limit":
             for i in range(len(rules)):
-                rule = rules[i].split("-j")[0]
-                rules.append(rule+f"{'--ctstate NEW' if self.log=='log' else ''}{' -m limit --limit 3/min --limit-burst 10' if logging_level in ('low','medium') else ''} -j {LOG_CHAIN_DENY if self.action in ('deny','reject') else LOG_CHAIN_ALLOW} {RULE_COMMENT}")
-            rules.reverse()
-        return '\n'.join(f"{i}" for i in rules)
+                rules[i] += f"{action} {RULE_COMMENT}"
+            if (self.log and logging_level != "off") or logging_level == "high":
+                for i in range(len(rules)):
+                    rule = rules[i].split("-j")[0]
+                    rules.append(rule+f"{'--ctstate NEW' if self.log=='log' else ''}{' -m limit --limit 3/min --limit-burst 10' if logging_level in ('low','medium') else ''} -j {LOG_CHAIN_DENY if self.action in ('deny','reject') else LOG_CHAIN_ALLOW} {RULE_COMMENT}")
+                rules.reverse()
+            return '\n'.join(f"{i}" for i in rules)
+        else:
+            limit_rules = []
+            for rule in rules:
+                limit_rules.append(f"{rule} -m recent --set --name DFW_DEFAULT --mask {'255.255.255.255' if ipv4 else 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'} --rsource {RULE_COMMENT}")
+                if (self.log and logging_level != "off") or logging_level == "high":
+                    limit_rules.append(f"{rule}{' --ctstate NEW' if self.log=='log' else ''}{' -m limit --limit 3/min --limit-burst 10' if logging_level in ('low','medium') else ''} -m recent --update --seconds 30 --hitcount 6 --name DFW_DEFAULT --mask {'255.255.255.255' if ipv4 else 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'} --rsource -j {LOG_CHAIN_LIMIT} {RULE_COMMENT}") # TODO NOW really not sure this is implemented according to spec. Need to see how ufw logs rules that trigger rate limiting with log level global option vs log/log-all option
+                limit_rules.append(f"{rule} -m recent --set --name DFW_DEFAULT --mask {'255.255.255.255' if ipv4 else 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'} --rsource -j REJECT {RULE_COMMENT}")
+                limit_rules.append(f"{rule} -j ACCEPT {RULE_COMMENT}")
+            return '\n'.join(f"{i}" for i in limit_rules)
 
     def print_rule_dfw(self) -> str:
         # print the rule as it was entered in ufw-like syntax
@@ -946,7 +957,7 @@ class Rule:
                 to_clause = f" to {self.dest_addr if self.dest_addr else 'any'}{' port '+self.dports if self.dports else ''}"
                 if self.dapp:
                     to_clause += f" app {self.dapp}"
-            return f"{self.action} {self.direction}{' on '+interface if interface else ''}{self.log+' ' if self.log else ''}{from_clause}{to_clause} {'proto '+self.protocol if self.protocol not in ('both', 'any', '') else ''}{' comment '+from_base64(self.comment) if self.comment else ''}"
+            return f"{self.action} {self.direction}{' on '+interface if interface else ''}{self.log+' ' if self.log else ''}{from_clause}{to_clause}{' proto '+self.protocol if self.protocol not in ('both', 'any', '') else ''}{' comment \"'+from_base64(self.comment)+'\"' if self.comment else ''}"
         else:
             port_proto = self.dports
             if self.protocol in ("tcp", "udp"):
@@ -955,7 +966,7 @@ class Rule:
 
     @staticmethod
     def get_applications() -> tuple[str]:
-        # TODO LATER implement some basic file-level validation logic here
+        # TODO implement some basic file-level validation logic here
         return tuple()
         return (
                 "ssh",
@@ -968,7 +979,7 @@ class Rule:
                 )
 
     def get_port_proto_from_app(self, app: str) -> (str, str):
-        # TODO LATER implement some validation logic here for the requested app
+        # TODO implement some validation logic here for the requested app
         # note: app entries use ini-syntax like:
         #    [SomeService]
         #    title=Some title
@@ -1057,6 +1068,8 @@ def make_default_rules(default_in: str, default_out: str, logging_level: str, ip
     top_rules.append(f"-A {CHAIN} -m conntrack --ctstate INVALID -j DROP {RULE_COMMENT}") # always drop invalid packets
     top_rules.append(f"-A {CHAIN} -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN {RULE_COMMENT}") # always allow existing connections and return immediately.
     if logging_level in ("low", "medium", "high", "full"): # add "low" logs
+        top_rules.insert(0, f"-N {LOG_CHAIN_LIMIT} {RULE_COMMENT}")
+        top_rules.insert(1, f"-A {LOG_CHAIN_LIMIT} -j LOG --log-prefix {LOG_PREFIX_LIMIT} --log-level 4 {RULE_COMMENT}")
         top_rules.insert(0, f"-N {LOG_CHAIN_DENY} {RULE_COMMENT}")
         top_rules.insert(1, f"-A {LOG_CHAIN_DENY} -j LOG --log-prefix {LOG_PREFIX_BLOCK} --log-level 4 {RULE_COMMENT}")
         top_rules.insert(0, f"-N {LOG_CHAIN_ALLOW} {RULE_COMMENT}")
@@ -1076,7 +1089,7 @@ def make_default_rules(default_in: str, default_out: str, logging_level: str, ip
             bottom_rules.append(f"-A {CHAIN} -s {'172.17.0.0/12' if not ipv6_subnet else ipv6_subnet} -m conntrack --ctdir ORIGINAL{' -m limit --limit 3/min --limit-burst 10' if logging_level=='medium' else ''} -j {LOG_CHAIN_ALLOW} {RULE_COMMENT}")
             bottom_rules.append(f"-A {CHAIN} -o docker0 -m conntrack --ctdir ORIGINAL{' -m limit --limit 3/min --limit-burst 10' if logging_level=='medium' else ''} -j {LOG_CHAIN_ALLOW} {RULE_COMMENT}")
     if logging_level in ("high", "full"):
-        pass # TODO LATER: log packets that have triggered rate limiting
+        pass # TODO NOW: log packets that have triggered rate limiting
     if logging_level == "full":
         top_rules.insert(4, f"-A {CHAIN} -m conntrack --ctstate ESTABLISHED,RELATED -j {LOG_CHAIN_ALLOW} {RULE_COMMENT}")
     if default_in in ("deny","reject"):
@@ -1154,7 +1167,7 @@ def generate_rules_text(rules: list[Rule], conf: Config) -> str:
             "# IPv6 standard rules\n"
             + '\n'.join(rule.replace(":_", ": ") for rule in top_rules6)
             + ("\n\n# IPv6 User rules\n" if len(rules) else '')
-            + ('\n\n'.join(f"{rule.print_rule_form()}\n{rule.print_rule_ipt(True, conf.logging_level, ipv6=True)}" for rule in rules if rule.ipv_type in ("6", "both")) if len(rules) else '')
+            + ('\n\n'.join(f"{rule.print_rule_form()}\n{rule.print_rule_ipt(True, conf.logging_level, False)}" for rule in rules if rule.ipv_type in ("6", "both")) if len(rules) else '')
             + "\n\n# IPv6 Default Policy rules\n"
             + '\n'.join(bottom_rules6)
             + "\n\n"
@@ -1345,7 +1358,7 @@ def push_rules_to_iptables(conf: Config) -> int:
         cmds6 = []
         top_rules6, bottom_rules6 = make_default_rules(conf.default_in, conf.default_out, conf.logging_level, conf.ipv6_subnet)
         cmds6.extend(f"ip6tables {rule}" for rule in top_rules6)
-        cmds6.extend(f"ip6tables {line}" for rule in rules for line in rule.print_rule_ipt(True, conf.logging_level).split("\n") if line and rule.ipv_type in ("6", "both"))
+        cmds6.extend(f"ip6tables {line}" for rule in rules for line in rule.print_rule_ipt(True, conf.logging_level).split("\n", False) if line and rule.ipv_type in ("6", "both"))
         cmds6.extend(f"ip6tables {rule}" for rule in bottom_rules6)
         log(f"{cmds6=}", level=TRACE)
         if (err_code := flush_chain(CHAIN, "6")):
@@ -1388,7 +1401,7 @@ def generate_statuses(numbered: bool, verbose: bool, ipv6_enabled:bool, logging_
         if ipv6_enabled:
             statuses.extend([rule.to_status(verbose, True) for rule in rules if rule.ipv_type in ("6", "both")])
     sep = 7
-    headers = ["To", "Action", "From\n"]
+    headers = ["To", "Action", "From", "\n"]
     if numbered:
         num_digits = len(str(len(statuses)))
         headers[0] = " "*(num_digits+3)+headers[0]
@@ -1397,23 +1410,23 @@ def generate_statuses(numbered: bool, verbose: bool, ipv6_enabled:bool, logging_
             del status[0]
     max_lens = []
     if len(statuses):
-        for i in range(3):
+        for i in range(4):
             max_lens.append(max(len(status_parts[i]) for status_parts in statuses))
     else:
-        max_lens = [0, 0, 0]
+        max_lens = [0, 0, 0, 0]
     header_padding = (' '*(max_lens[0]-len(headers[0])+sep), ' '*(max_lens[1]-len(headers[1])+sep))
     headers.insert(1, header_padding[0])
     headers.insert(3, header_padding[1])
     padded_statuses = []
     for status_parts in statuses:
         padded_parts = []
-        for i in range(3):
+        for i in range(4):
             padded_parts.append(status_parts[i]+" "*(max_lens[i]-len(status_parts[i])))
         padded_statuses.append(tuple(padded_parts))
     joined_headers = ''.join(headers)
     if verbose:
         content = f"Status: active\nLogging: {logging_level}\nDefault: {default_in} (incoming), {default_out} (outgoing)\nNew profiles: skip\n\n" + joined_headers
-        # TODO LATER when adding support for applications, change the logic for New profiles in the line above, although skip is the recommended behavior, so I may just make it the only option...
+        # TODO when adding support for applications, change the logic for New profiles in the line above, although skip is the recommended behavior, so I may just make it the only option...
     else:
         content = "Status: active\n\n" + joined_headers
     if numbered and ipv6_enabled:
@@ -1421,7 +1434,7 @@ def generate_statuses(numbered: bool, verbose: bool, ipv6_enabled:bool, logging_
     dash_line = ''.join([" " if char in (" ", "\n") else "-" for char in joined_headers]) + "\n"
     content += dash_line
     for status_parts in padded_statuses:
-        content += f"{status_parts[0]}{' '*sep}{status_parts[1]}{' '*sep}{status_parts[2]}\n"
+        content += f"{status_parts[0]}{' '*sep}{status_parts[1]}{' '*sep}{status_parts[2]}{' '*sep}{status_parts[3]}\n"
     return content,0
 
 def enable_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
@@ -1559,7 +1572,7 @@ def rule_func(args: argparse.Namespace, remainder: tuple[str]) -> int:
         #     log("ERROR: Internal consistency check failed!", level=ERROR)
         #     return INTERNAL_ERROR
         if rule.action and not args.dry_run:
-            log(rule.print_rule_ipt(logging_level=args.config.logging_level), level=TRACE)
+            log(rule.print_rule_ipt(logging_level=args.config.logging_level, ipv4=(rule.ipv_type in ("4","both"))), level=TRACE)
     if not args.dry_run:
         if err_code := (confirm_root_and_chain() or write_rules_file(new_rules,summary)):
             return err_code
